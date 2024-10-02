@@ -8,7 +8,7 @@ import optax
 from flax.linen import initializers
 
 from craftax.craftax_classic.envs.craftax_state import EnvParams, StaticEnvParams
-from craftax.craftax_classic.envs.craftax_symbolic_env import CraftaxClassicSymbolicEnv
+from craftax.craftax_classic.envs.craftax_symbolic_env import CraftaxClassicSymbolicEnv, CraftaxClassicSymbolicEnvNoAutoReset
 from craftax.craftax_classic.game_logic import are_players_alive
 from craftax.craftax_classic.train.logger import TrainLogger
 
@@ -115,6 +115,7 @@ class ClassicMetaController:
         static_parameters: StaticEnvParams = StaticEnvParams(),
         num_envs: int = 8,
         num_steps: int = 300,
+        fixed_timesteps: bool = False,
         num_iterations: int = 100,
         learning_rate: float = 2.5e-3,
         anneal_lr: bool = True,
@@ -138,6 +139,7 @@ class ClassicMetaController:
         - num_envs: number of environments to run in parallel during rollout
         - num_steps: Number of steps to take for each batch. Note that this can be less than
             the actual number of steps used for training since the agent can be dead for some steps
+        - fixed_timesteps: Fix the number of timesteps per episode
         - num_iterations: Number of rollout/training iterations
         - learning_rate: learning rate
         - anneal_lr: whether to anneal learning rate
@@ -155,8 +157,13 @@ class ClassicMetaController:
         """
         self.static_params = static_parameters
         self.num_envs = num_envs
-        self.env = CraftaxClassicSymbolicEnv(self.static_params)
+        self.fixed_timesteps = fixed_timesteps
         self.env_params = env_params
+        self.timestep = self.env_params.max_timesteps
+        if self.fixed_timesteps:
+            self.env = CraftaxClassicSymbolicEnvNoAutoReset(self.static_params)
+        else:
+            self.env = CraftaxClassicSymbolicEnv(self.static_params)
         self.step_fn = jax.vmap(
             self.env.step, in_axes=(0, 0, 1, None), out_axes=(1, 0, 1, 1, 0)
         )
@@ -192,6 +199,11 @@ class ClassicMetaController:
         self.lr_schedule = optax.linear_schedule(
             self.learning_rate, 0.0, self.num_iterations
         )
+        self.timestep_schedule = optax.linear_schedule(
+            self.env_params.max_timesteps * 0.01,
+            self.env_params.max_timesteps,
+            round(self.num_iterations * 0.8)
+        )
 
     @partial(jax.jit, static_argnums=(0,))
     def train_some_episodes(
@@ -205,6 +217,9 @@ class ClassicMetaController:
             opt_states[1].hyperparams["learning_rate"] = jnp.full(  # pyright: ignore
                 self.static_params.num_players, self.lr_schedule(tick)
             )
+        env_params = self.env_params
+        if self.fixed_timesteps:
+            env_params = env_params.replace(max_timesteps=self.timestep_schedule(tick))  # pyright: ignore
 
         def rollout_step(carry, step):
             (
