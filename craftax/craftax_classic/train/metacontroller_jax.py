@@ -600,7 +600,7 @@ class ClassicMetaController:
                 print("Agent", agent, "value loss:", agent_v_loss[agent])
                 print("Agent", agent, "entropy:", agent_entropy_loss[agent])
                 print("Agent", agent, "reward:", rewards[agent])
-                print("Agent", agent, "approx KL:", last_approx_kl[agent])
+                print("Agent", agent, "approx KL:", last_approx_kl[agent], flush=True)
         return model_params, opt_states, log
 
     def run_one_episode(self, model_params):
