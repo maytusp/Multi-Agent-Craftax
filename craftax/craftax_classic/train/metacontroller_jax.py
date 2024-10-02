@@ -268,7 +268,7 @@ class ClassicMetaController:
                 jax.random.split(_rng, self.num_envs),
                 env_state,
                 action.astype(int),
-                self.env_params,
+                env_params,
             )
             next_done = next_done.astype(float)
             return (
