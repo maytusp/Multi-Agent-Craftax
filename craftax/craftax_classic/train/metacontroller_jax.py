@@ -160,10 +160,11 @@ class ClassicMetaController:
         self.fixed_timesteps = fixed_timesteps
         self.env_params = env_params
         self.timestep = self.env_params.max_timesteps
-        if self.fixed_timesteps:
-            self.env = CraftaxClassicSymbolicEnvNoAutoReset(self.static_params)
-        else:
-            self.env = CraftaxClassicSymbolicEnv(self.static_params)
+        # if self.fixed_timesteps:
+        #     self.env = CraftaxClassicSymbolicEnvNoAutoReset(self.static_params)
+        # else:
+        #     self.env = CraftaxClassicSymbolicEnv(self.static_params)
+        self.env = CraftaxClassicSymbolicEnv(self.static_params)
         self.step_fn = jax.vmap(
             self.env.step, in_axes=(0, 0, 1, None), out_axes=(1, 0, 1, 1, 0)
         )
@@ -649,11 +650,12 @@ if __name__ == "__main__":
         num_envs=128,
         num_minibatches=2,
         num_steps=200,
-        num_iterations=25,
+        num_iterations=5,
         update_epochs=5,
         anneal_lr=False,
         learning_rate=2.5e-4,
         max_grad_norm=1.0,
+        fixed_timesteps=True,
     )
     params, opt_states, log = metacontroller.train()
     # states, actions, logits, rewards = metacontroller.run_one_episode(params)
