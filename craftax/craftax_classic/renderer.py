@@ -5,7 +5,12 @@ from craftax.craftax_classic.game_logic import are_players_alive
 from craftax.craftax_classic.envs.craftax_state import Mobs
 
 
-def render_craftax_symbolic(state, player=0):
+def render_craftax_symbolic(state, player=0, observe_others=False):
+    """
+    If observe_others is True, then the player_ids are rendered in the
+    map and the current player's inventory and intrinsics are not rendered
+    (they should be rendered with render_others_inventories)
+    """
     obs_dim_array = jnp.array([OBS_DIM[0], OBS_DIM[1]], dtype=jnp.int32)
 
     players_alive = are_players_alive(state)
@@ -62,21 +67,64 @@ def render_craftax_symbolic(state, player=0):
         (mob_map, state.arrows, 3),
         jnp.arange(state.arrows.mask.shape[0]),
     )
-    # Add other player positions to mob map
-    players_as_mob = Mobs(
-        position=state.player_position,
-        health=state.player_health,  # ignored
-        # No need to show current player as they will be in the center anyways
-        mask=players_alive.at[player].set(False),
-        attack_cooldown=jnp.zeros_like(state.player_health),  # ignored
-    )
-    (mob_map, _, _), _ = jax.lax.scan(
-        _add_mob_to_map,
-        (mob_map, players_as_mob, 4),
-        jnp.arange(state.player_position.shape[0])
-    )
+    if observe_others:
+        # add player ids to the last layer in mob_map
+        def _add_player_to_map(carry, player_idx):
+            mob_map, position, mask = carry
+
+            local_position = (
+                position[player_idx]
+                - state.player_position[player]
+                + jnp.array([OBS_DIM[0], OBS_DIM[1]]) // 2
+            )
+            on_screen = jnp.logical_and(
+                local_position >= 0, local_position < jnp.array([OBS_DIM[0], OBS_DIM[1]])
+            ).all()
+            on_screen *= mask[player_idx]
+
+            mob_map = mob_map.at[local_position[0], local_position[1], 4].set(
+                # We will have the player idx here
+                (player_idx * on_screen).astype(jnp.uint8)
+            )
+
+            return (mob_map, position, mask), None
+        (mob_map, _, _), _ = jax.lax.scan(
+            _add_player_to_map,
+            (mob_map, state.player_position, players_alive.at[player].set(False)),
+            jnp.arange(state.player_position.shape[0])
+        )
+    else:
+        # Add other player positions to mob map
+        players_as_mob = Mobs(
+            position=state.player_position,
+            health=state.player_health,  # ignored
+            # No need to show current player as they will be in the center anyways
+            mask=players_alive.at[player].set(False),
+            attack_cooldown=jnp.zeros_like(state.player_health),  # ignored
+        )
+        (mob_map, _, _), _ = jax.lax.scan(
+            _add_mob_to_map,
+            (mob_map, players_as_mob, 4),
+            jnp.arange(state.player_position.shape[0])
+        )
 
     all_map = jnp.concatenate([map_view_one_hot, mob_map], axis=-1)
+
+    direction = jax.nn.one_hot(state.player_direction[player] - 1, num_classes=4)
+
+    is_alive = players_alive[player]
+
+    if observe_others:
+        # No need to render inventory
+        # (they should be rendered with render_others_inventories)
+        all_flattened = jnp.concatenate(
+            [
+                all_map.flatten(),
+                direction,
+                jnp.array([state.light_level, is_alive])
+            ]
+        )
+        return all_flattened
 
     # Inventory
     inventory = (
@@ -110,10 +158,6 @@ def render_craftax_symbolic(state, player=0):
         ).astype(jnp.float16)
         / 10.0
     )
-
-    direction = jax.nn.one_hot(state.player_direction[player] - 1, num_classes=4)
-
-    is_alive = players_alive[player]
 
     all_flattened = jnp.concatenate(
         [
@@ -789,14 +833,40 @@ def render_craftax_pixels(state, block_pixel_size, num_players, player=0):
 
     return pixels
 
+def render_others_inventories(state):
+    """
+    Renders the inventory of all players
+    """
+    return jnp.stack(
+        [
+            state.inventory.wood,
+            state.inventory.stone,
+            state.inventory.coal,
+            state.inventory.iron,
+            state.inventory.diamond,
+            state.inventory.sapling,
+            state.inventory.wood_pickaxe,
+            state.inventory.stone_pickaxe,
+            state.inventory.iron_pickaxe,
+            state.inventory.wood_sword,
+            state.inventory.stone_sword,
+            state.inventory.iron_sword,
+            state.player_health,
+            state.player_food,
+            state.player_drink,
+            state.player_energy,
+            state.is_sleeping,
+        ],
+         axis=1,
+    ).astype(jnp.float16) / 10.0
 
-def render_pixels_empty(block_pixel_size):
-    pixels = jnp.zeros(
-        (
-            OBS_DIM * block_pixel_size,
-            (OBS_DIM + INVENTORY_OBS_HEIGHT) * block_pixel_size,
-            3,
-        ),
-        dtype=jnp.float32,
-    )
-    return pixels
+# def render_pixels_empty(block_pixel_size):
+#     pixels = jnp.zeros(
+#         (
+#             OBS_DIM * block_pixel_size,
+#             (OBS_DIM + INVENTORY_OBS_HEIGHT) * block_pixel_size,
+#             3,
+#         ),
+#         dtype=jnp.float32,
+#     )
+#     return pixels

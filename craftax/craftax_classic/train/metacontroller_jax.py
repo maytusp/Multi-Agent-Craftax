@@ -8,61 +8,15 @@ import optax
 from flax.linen import initializers
 
 from craftax.craftax_classic.envs.craftax_state import EnvParams, StaticEnvParams
-from craftax.craftax_classic.envs.craftax_symbolic_env import CraftaxClassicSymbolicEnv, CraftaxClassicSymbolicEnvNoAutoReset
+from craftax.craftax_classic.envs.craftax_symbolic_env import CraftaxClassicSymbolicEnv, CraftaxClassicSymbolicEnvShareStats
 from craftax.craftax_classic.game_logic import are_players_alive
 from craftax.craftax_classic.train.logger import TrainLogger
-
-
-class LSTM(nn.Module):
-    features: int
-
-    @nn.compact
-    def __call__(self, x, terminations, last_state):
-        features = self.features
-        batch_size = last_state[0].shape[0]
-
-        reshaped_x = x.reshape(-1, batch_size, features)
-        reshaped_terminations = terminations.reshape(-1, batch_size)
-
-        class LSTMOut(nn.Module):
-            @nn.compact
-            def __call__(self, carry, inputs):
-                inputs, terminate = inputs
-                # Reset the hidden state on termination
-                carry = jax.tree.map(
-                    lambda carry_component: jax.lax.select(
-                        jnp.repeat(
-                            jnp.reshape(terminate != 0.0, (-1, 1)),
-                            carry_component.shape[1],
-                            axis=1,
-                        ),
-                        jnp.zeros_like(carry_component),
-                        carry_component,
-                    ),
-                    carry,
-                )
-                (new_c, new_h), new_h = nn.OptimizedLSTMCell(
-                    features,
-                    kernel_init=initializers.orthogonal(jnp.sqrt(2)),
-                    bias_init=initializers.constant(0.0),
-                )(carry, inputs)
-                return (new_c, new_h), ((new_c, new_h), new_h)
-
-        model = nn.scan(
-            LSTMOut, variable_broadcast="params", split_rngs={"params": False}
-        )
-        final_state, (new_states, y_t) = model()(
-            last_state, (reshaped_x, reshaped_terminations)
-        )
-
-        if reshaped_x.shape[0] == 1:
-            y_t = jnp.squeeze(y_t, axis=0)
-
-        return y_t, final_state
+from craftax.craftax_classic.train.nets import LSTM, ZNet
 
 
 class CraftaxAgent(nn.Module):
     action_space: int
+    observe_others: bool
 
     def setup(self):
         self.network = nn.Sequential(
@@ -80,8 +34,16 @@ class CraftaxAgent(nn.Module):
         self.critic_1 = nn.Dense(64, kernel_init=initializers.orthogonal(2))
         self.critic_out = nn.Dense(1, kernel_init=initializers.orthogonal(1.0))
         self.lstm = LSTM(32)
+        self.znet = ZNet()
 
     def get_states(self, x, lstm_state, done):
+        if self.observe_others:
+            agent_data, inventories = x
+            inventories = self.znet(inventories)
+            new_inventory_shape = inventories.shape[:-2] + (-1,)
+            x = jnp.concatenate(
+                [agent_data, inventories.reshape(new_inventory_shape)], axis=-1
+            )
         x = self.network(x)
         return self.lstm(x, done, lstm_state)
 
@@ -116,6 +78,7 @@ class ClassicMetaController:
         num_envs: int = 8,
         num_steps: int = 300,
         fixed_timesteps: bool = False,
+        observe_others: bool = False,
         num_iterations: int = 100,
         learning_rate: float = 2.5e-3,
         anneal_lr: bool = True,
@@ -140,6 +103,7 @@ class ClassicMetaController:
         - num_steps: Number of steps to take for each batch. Note that this can be less than
             the actual number of steps used for training since the agent can be dead for some steps
         - fixed_timesteps: Fix the number of timesteps per episode
+        - observe_others: Players can observe other players' inventories
         - num_iterations: Number of rollout/training iterations
         - learning_rate: learning rate
         - anneal_lr: whether to anneal learning rate
@@ -160,11 +124,15 @@ class ClassicMetaController:
         self.fixed_timesteps = fixed_timesteps
         self.env_params = env_params
         self.timestep = self.env_params.max_timesteps
+        self.observe_others = observe_others
         # if self.fixed_timesteps:
         #     self.env = CraftaxClassicSymbolicEnvNoAutoReset(self.static_params)
         # else:
         #     self.env = CraftaxClassicSymbolicEnv(self.static_params)
-        self.env = CraftaxClassicSymbolicEnv(self.static_params)
+        if observe_others:
+            self.env = CraftaxClassicSymbolicEnvShareStats(self.static_params)
+        else:
+            self.env = CraftaxClassicSymbolicEnv(self.static_params)
         self.step_fn = jax.vmap(
             self.env.step, in_axes=(0, 0, 1, None), out_axes=(1, 0, 1, 1, 0)
         )
@@ -192,7 +160,7 @@ class ClassicMetaController:
         # self.target_kl = target_kl
         self.num_iterations = num_iterations
 
-        self.agent = CraftaxAgent(self.action_space.n)
+        self.agent = CraftaxAgent(self.action_space.n, observe_others)
         self.optimizer = optax.chain(
             optax.clip_by_global_norm(self.max_grad_norm),
             optax.inject_hyperparams(optax.adam)(learning_rate=self.learning_rate),
@@ -532,9 +500,19 @@ class ClassicMetaController:
 
     def train(self, model_params=None):
         if model_params is None:
-            dummy_obs = jnp.ones(
-                (self.num_steps, self.num_envs) + self.observation_space.shape
-            )
+            if self.observe_others:
+                dummy_obs = (
+                    jnp.ones(
+                        (self.num_steps, self.num_envs) + self.observation_space.spaces[0].shape  # pyright: ignore
+                    ),
+                    jnp.ones(
+                        (self.num_steps, self.num_envs) + self.observation_space.spaces[1].shape  # pyright: ignore
+                    )
+                )
+            else:
+                dummy_obs = jnp.ones(
+                    (self.num_steps, self.num_envs) + self.observation_space.shape  # pyright: ignore
+                )
             dummy_lstm_state = (
                 jnp.ones((self.num_envs, 32)),
                 jnp.ones((self.num_envs, 32)),
@@ -643,12 +621,24 @@ class ClassicMetaController:
             rewards.append(reward)
         return states, actions, logits, rewards
 
+    def _idx(self, obj, *args):
+        """
+        Helpful utility to index object like a PyTree
+        if observe_others is set to true, or treat it like an array otherwise
+        """
+        if self.observe_others:
+            return jax.tree_util.tree_map(
+                lambda x: x[*args],
+                obj
+            )
+        return obj[*args]
+
 
 if __name__ == "__main__":
     metacontroller = ClassicMetaController(
         static_parameters=StaticEnvParams(num_players=4),
-        num_envs=128,
-        num_minibatches=2,
+        num_envs=10,
+        num_minibatches=1,
         num_steps=200,
         num_iterations=5,
         update_epochs=5,
@@ -656,6 +646,7 @@ if __name__ == "__main__":
         learning_rate=2.5e-4,
         max_grad_norm=1.0,
         fixed_timesteps=True,
+        observe_others=False,
     )
     params, opt_states, log = metacontroller.train()
     # states, actions, logits, rewards = metacontroller.run_one_episode(params)
