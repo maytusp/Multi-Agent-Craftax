@@ -206,9 +206,9 @@ class ClassicMetaController:
                 rng, _rng = jax.random.split(rng)
                 logits, value, next_lstm_state = self.agent.apply(  # pyright: ignore
                     model_param,
-                    next_obs[agent_idx],
+                    self._idx(next_obs)[agent_idx],
                     next_lstm_state,
-                    next_done[agent_idx],
+                    self._idx(next_done)[agent_idx],
                 )
                 # sets the action to NOOP if player is dead or sleeping
                 # I think this does more harm than good
@@ -377,13 +377,13 @@ class ClassicMetaController:
         envinds = jnp.arange(self.num_envs)
 
         def process_agent(agent_idx, model_param, opt_state, rng):
-            b_obs = obs[:, agent_idx]
-            b_logprobs = logprobs[:, agent_idx]
-            b_actions = actions[:, agent_idx]
-            b_dones = dones[:, agent_idx]
-            b_advantages = advantages[:, agent_idx]
-            b_returns = returns[:, agent_idx]
-            b_values = values[:, agent_idx]
+            b_obs = self._idx(obs)[:, agent_idx]
+            b_logprobs = self._idx(logprobs)[:, agent_idx]
+            b_actions = self._idx(actions)[:, agent_idx]
+            b_dones = self._idx(dones)[:, agent_idx]
+            b_advantages = self._idx(advantages)[:, agent_idx]
+            b_returns = self._idx(returns)[:, agent_idx]
+            b_values = self._idx(values)[:, agent_idx]
 
             def do_epoch(carry, epoch):
                 rng, model_param, optimizer_state = carry
@@ -397,13 +397,13 @@ class ClassicMetaController:
                         shuffled_envinds, (start,), (envsperbatch,)
                     )
 
-                    mb_obs = b_obs[:, mbenvinds]
-                    mb_logprobs = b_logprobs[:, mbenvinds]
-                    mb_actions = b_actions[:, mbenvinds]
-                    mb_dones = b_dones[:, mbenvinds]
-                    mb_advantages = b_advantages[:, mbenvinds]
-                    mb_returns = b_returns[:, mbenvinds]
-                    mb_values = b_values[:, mbenvinds]
+                    mb_obs = self._idx(b_obs)[:, mbenvinds]
+                    mb_logprobs = self._idx(b_logprobs)[:, mbenvinds]
+                    mb_actions = self._idx(b_actions)[:, mbenvinds]
+                    mb_dones = self._idx(b_dones)[:, mbenvinds]
+                    mb_advantages = self._idx(b_advantages)[:, mbenvinds]
+                    mb_returns = self._idx(b_returns)[:, mbenvinds]
+                    mb_values = self._idx(b_values)[:, mbenvinds]
                     init_lstm_state = jax.tree.map(
                         lambda state: state[agent_idx, mbenvinds], init_lstm_states
                     )
@@ -621,17 +621,25 @@ class ClassicMetaController:
             rewards.append(reward)
         return states, actions, logits, rewards
 
-    def _idx(self, obj, *args):
+    class _Indexer:
+        def __init__(self, obj, observe_others: bool):
+            self.obj = obj
+            self.observe_others = observe_others
+        
+        def __getitem__(self, val):
+            if self.observe_others:
+                return jax.tree_util.tree_map(
+                    lambda x: x[val],
+                    self.obj
+                )
+            return self.obj[val]
+
+    def _idx(self, obj):
         """
-        Helpful utility to index object like a PyTree
-        if observe_others is set to true, or treat it like an array otherwise
+        Helpful utility to index object like a PyTree if observe_others
+        is set to true, or treat it like an array otherwise
         """
-        if self.observe_others:
-            return jax.tree_util.tree_map(
-                lambda x: x[*args],
-                obj
-            )
-        return obj[*args]
+        return self._Indexer(obj, self.observe_others)
 
 
 if __name__ == "__main__":
@@ -646,7 +654,7 @@ if __name__ == "__main__":
         learning_rate=2.5e-4,
         max_grad_norm=1.0,
         fixed_timesteps=True,
-        observe_others=False,
+        observe_others=True,
     )
     params, opt_states, log = metacontroller.train()
     # states, actions, logits, rewards = metacontroller.run_one_episode(params)
@@ -657,7 +665,7 @@ if __name__ == "__main__":
     # dummy_lstm_state = (jnp.ones((n_envs, 32)), jnp.ones((n_envs, 32)))
     # dummy_done = jnp.ones((n_steps, n_envs))
     # print(
-    #     CraftaxAgent(17).tabulate(
+    #     CraftaxAgent(17, True).tabulate(
     #         jax.random.PRNGKey(randrange(2**31)),
     #         dummy_obs,
     #         dummy_lstm_state,
