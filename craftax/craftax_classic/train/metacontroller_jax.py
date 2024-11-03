@@ -596,7 +596,7 @@ class ClassicMetaController:
         )
 
         def eval_agent(model_param, next_lstm_state, next_obs, next_done, rng):
-            logits, value, next_lstm_state = self.agent.apply(  # pyright: ignore
+            logits, _value, next_lstm_state = self.agent.apply(  # pyright: ignore
                 model_param, next_obs, next_lstm_state, next_done
             )
             action = jax.random.categorical(rng, logits).squeeze()
@@ -654,7 +654,7 @@ if __name__ == "__main__":
         learning_rate=2.5e-4,
         max_grad_norm=1.0,
         fixed_timesteps=True,
-        observe_others=True,
+        observe_others=False,
     )
     params, opt_states, log = metacontroller.train()
     # states, actions, logits, rewards = metacontroller.run_one_episode(params)
