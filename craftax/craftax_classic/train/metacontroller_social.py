@@ -1,14 +1,18 @@
 from functools import partial
 from random import randrange
+from typing import Sequence
 
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax
 from flax.linen import initializers
 
 from craftax.craftax_classic.envs.craftax_state import EnvParams, StaticEnvParams
-from craftax.craftax_classic.envs.craftax_symbolic_env import CraftaxClassicSymbolicEnvShareStats
+from craftax.craftax_classic.envs.craftax_symbolic_env import (
+    CraftaxClassicSymbolicEnvShareStats,
+)
 from craftax.craftax_classic.game_logic import are_players_alive
 from craftax.craftax_classic.train.logger import TrainLogger
 from craftax.craftax_classic.train.nets import LSTM, ZNet
@@ -17,10 +21,13 @@ from craftax.craftax_classic.train.nets import LSTM, ZNet
 class AuxLossNet(nn.Module):
     output_size: int
 
+    @nn.compact
     def __call__(self, x):
         x = nn.Dense(64)(x)
-        x = nn.relu
+        x = nn.relu(x)
         x = nn.Dense(32)(x)
+        x = nn.relu(x)
+        x = nn.Dense(self.output_size)(x)
         return x
 
 
@@ -75,7 +82,7 @@ class CraftaxAgent(nn.Module):
         hidden, lstm_state = self.get_states(x, lstm_state, done)
         logits = self.actor(hidden)
         value = self.critic(hidden)
-        return logits, value, lstm_state
+        return logits, value, hidden, lstm_state
 
 
 class ClassicMetaController:
@@ -98,6 +105,7 @@ class ClassicMetaController:
         clip_vloss: bool = True,
         ent_coef: float = 0.01,
         vf_coef: float = 0.5,
+        aux_coef: float = 0.3,
         max_grad_norm: float = 0.5,
         # target_kl: float | None = None,
     ):
@@ -122,7 +130,7 @@ class ClassicMetaController:
         - clip_vloss: Whether to use clipped loss for the value function
         - ent_coef: Entropy coefficient
         - vf_coef: Value function coefficient
-        - obs_coef: Coefficient for observation prediction
+        - aux_coef: Auxillary loss coefficient
         - max_grad_norm: The maximum norm for gradient clipping
         - target_kl: target KL divergence threshold
         """
@@ -159,11 +167,16 @@ class ClassicMetaController:
         self.clip_vloss = clip_vloss
         self.ent_coef = ent_coef
         self.vf_coef = vf_coef
+        self.aux_coef = aux_coef
         self.max_grad_norm = max_grad_norm
         # self.target_kl = target_kl
         self.num_iterations = num_iterations
 
         self.agent = CraftaxAgent(self.action_space.n)
+        self.aux = AuxLossNet(
+            np.prod(self.observation_space.spaces[0].shape)  # pyright: ignore
+            + np.prod(self.observation_space.spaces[1].shape)  # pyright: ignore
+        )
         self.optimizer = optax.chain(
             optax.clip_by_global_norm(self.max_grad_norm),
             optax.inject_hyperparams(optax.adam)(learning_rate=self.learning_rate),
@@ -174,7 +187,7 @@ class ClassicMetaController:
         self.timestep_schedule = optax.linear_schedule(
             self.env_params.max_timesteps * 0.01,
             self.env_params.max_timesteps,
-            round(self.num_iterations * 0.8)
+            round(self.num_iterations * 0.8),
         )
 
     @partial(jax.jit, static_argnums=(0,))
@@ -182,6 +195,7 @@ class ClassicMetaController:
         self, rng, tick, model_params, opt_states, next_lstm_states, next_obs, env_state
     ):
         rng, _rng = jax.random.split(rng)
+        agent_params, aux_params = model_params
         next_done = jnp.zeros((self.static_params.num_players, self.num_envs))
         init_lstm_states = next_lstm_states
         if self.anneal_lr:
@@ -203,15 +217,16 @@ class ClassicMetaController:
             ) = carry
             init_obs = next_obs
             init_done = next_done
+            init_lstm_states = next_lstm_states
             # agents_alive = self.player_alive_check(env_state)
 
-            def eval_agent(rng, agent_idx, model_param, next_lstm_state):
+            def eval_agent(rng, agent_idx, agent_param, next_lstm_state):
                 rng, _rng = jax.random.split(rng)
-                logits, value, next_lstm_state = self.agent.apply(  # pyright: ignore
-                    model_param,
+                logits, value, _, next_lstm_state = self.agent.apply(  # pyright: ignore
+                    agent_param,
                     self._idx(next_obs)[agent_idx],
                     next_lstm_state,
-                    self._idx(next_done)[agent_idx],
+                    next_done[agent_idx],
                 )
                 # sets the action to NOOP if player is dead or sleeping
                 # I think this does more harm than good
@@ -232,7 +247,7 @@ class ClassicMetaController:
             value, action, logprob, next_lstm_states = jax.vmap(eval_agent)(
                 jax.random.split(_rng, self.static_params.num_players),
                 jnp.arange(self.static_params.num_players),
-                model_params,
+                agent_params,
                 next_lstm_states,
             )
             rng, _rng = jax.random.split(rng)
@@ -249,7 +264,7 @@ class ClassicMetaController:
                 env_state,
                 next_lstm_states,
                 rng,
-            ), (init_obs, init_done, value, action, logprob, reward)
+            ), (init_obs, next_obs, init_done, value, action, logprob, reward)
 
         # ugly code
         (
@@ -260,7 +275,7 @@ class ClassicMetaController:
                 next_lstm_states,
                 rng,
             ),
-            (obs, dones, values, actions, logprobs, rewards),
+            (obs, future_obs, dones, values, actions, logprobs, rewards),
         ) = jax.lax.scan(
             rollout_step,
             (
@@ -274,9 +289,9 @@ class ClassicMetaController:
         )
 
         # bootstrap value if not done
-        def produce_value(model_param, next_obs, next_lstm_state, next_done):
+        def produce_value(agent_param, next_obs, next_lstm_state, next_done):
             return self.agent.apply(
-                model_param,
+                agent_param,
                 next_obs,
                 next_lstm_state,
                 next_done,
@@ -284,7 +299,7 @@ class ClassicMetaController:
             ).flatten()  # pyright: ignore
 
         next_values = jax.vmap(produce_value)(
-            model_params, next_obs, next_lstm_states, next_done
+            agent_params, next_obs, next_lstm_states, next_done
         ).reshape(self.static_params.num_players, self.num_envs)
 
         def compute_advantages(carry, transition):
@@ -308,6 +323,7 @@ class ClassicMetaController:
         def ppo_loss(
             model_params,
             mb_obs,
+            mb_future_obs,
             mb_logprobs,
             mb_actions,
             mb_dones,
@@ -316,8 +332,9 @@ class ClassicMetaController:
             mb_values,
             init_lstm_state,
         ):
-            logits, newvalue, _ = self.agent.apply(  # pyright: ignore
-                model_params, mb_obs, init_lstm_state, mb_dones
+            agent_params, aux_params = model_params
+            logits, newvalue, hidden, _ = self.agent.apply(  # pyright: ignore
+                agent_params, mb_obs, init_lstm_state, mb_dones
             )
             probs = jax.nn.softmax(logits)
             newlogprobs = jnp.log(probs)
@@ -328,7 +345,6 @@ class ClassicMetaController:
             ).squeeze(-1)
             logratio = newlogprob - mb_logprobs
             ratio = jnp.exp(logratio)
-
 
             # calculate approx kl
             # old_approx_kl = (-logratio).mean()
@@ -363,12 +379,25 @@ class ClassicMetaController:
             else:
                 v_loss = 0.5 * ((newvalue - mb_returns) ** 2).mean()
 
+            # Auxillary Loss
+            # given the array of predicted accuracy, take the mean
+            predicted_future_obs = self.aux.apply(aux_params, hidden)
+            reshaped_future_obs = jax.tree_util.tree_map(
+                lambda x: x.reshape(x.shape[:2] + (-1,)),
+                mb_future_obs,
+            )
+            concat_future_obs = jnp.concatenate([reshaped_future_obs[0], reshaped_future_obs[1]], axis=2)
+            aux_error = concat_future_obs - predicted_future_obs
+            aux_loss = jnp.mean(jnp.square(aux_error))
+
+            # Entropy Loss
             entropy_loss = entropy.mean()
-            loss = pg_loss - self.ent_coef * entropy_loss + v_loss * self.vf_coef
+            loss = pg_loss - self.ent_coef * entropy_loss + v_loss * self.vf_coef + aux_loss * self.aux_coef
             return loss, (
                 pg_loss,
                 v_loss,
                 entropy_loss,
+                aux_loss,
                 jax.lax.stop_gradient(approx_kl),
             )
 
@@ -382,12 +411,13 @@ class ClassicMetaController:
 
         def process_agent(agent_idx, model_param, opt_state, rng):
             b_obs = self._idx(obs)[:, agent_idx]
-            b_logprobs = self._idx(logprobs)[:, agent_idx]
-            b_actions = self._idx(actions)[:, agent_idx]
-            b_dones = self._idx(dones)[:, agent_idx]
-            b_advantages = self._idx(advantages)[:, agent_idx]
-            b_returns = self._idx(returns)[:, agent_idx]
-            b_values = self._idx(values)[:, agent_idx]
+            b_future_obs = self._idx(future_obs)[:, agent_idx]
+            b_logprobs = logprobs[:, agent_idx]
+            b_actions = actions[:, agent_idx]
+            b_dones = dones[:, agent_idx]
+            b_advantages = advantages[:, agent_idx]
+            b_returns = returns[:, agent_idx]
+            b_values = values[:, agent_idx]
 
             def do_epoch(carry, epoch):
                 rng, model_param, optimizer_state = carry
@@ -402,19 +432,21 @@ class ClassicMetaController:
                     )
 
                     mb_obs = self._idx(b_obs)[:, mbenvinds]
-                    mb_logprobs = self._idx(b_logprobs)[:, mbenvinds]
-                    mb_actions = self._idx(b_actions)[:, mbenvinds]
-                    mb_dones = self._idx(b_dones)[:, mbenvinds]
-                    mb_advantages = self._idx(b_advantages)[:, mbenvinds]
-                    mb_returns = self._idx(b_returns)[:, mbenvinds]
-                    mb_values = self._idx(b_values)[:, mbenvinds]
+                    mb_future_obs = self._idx(b_future_obs)[:, mbenvinds]
+                    mb_logprobs = b_logprobs[:, mbenvinds]
+                    mb_actions = b_actions[:, mbenvinds]
+                    mb_dones = b_dones[:, mbenvinds]
+                    mb_advantages = b_advantages[:, mbenvinds]
+                    mb_returns = b_returns[:, mbenvinds]
+                    mb_values = b_values[:, mbenvinds]
                     init_lstm_state = jax.tree.map(
                         lambda state: state[agent_idx, mbenvinds], init_lstm_states
                     )
 
-                    (loss, (pg_loss, v_loss, entropy_loss, approx_kl)), grads = grad_fn(
+                    (loss, (pg_loss, v_loss, entropy_loss, aux_loss, approx_kl)), grads = grad_fn(
                         model_param,
                         mb_obs,
+                        mb_future_obs,
                         mb_logprobs,
                         mb_actions,
                         mb_dones,
@@ -432,12 +464,13 @@ class ClassicMetaController:
                         pg_loss,
                         v_loss,
                         entropy_loss,
+                        aux_loss,
                         approx_kl,
                     )
 
                 (
                     (model_param, optimizer_state),
-                    (losses, pg_losses, v_losses, entropy_losses, approx_kl),
+                    (losses, pg_losses, v_losses, entropy_losses, aux_losses, approx_kl),
                 ) = jax.lax.scan(
                     do_minibatch,
                     (model_param, optimizer_state),
@@ -449,12 +482,13 @@ class ClassicMetaController:
                     pg_losses,
                     v_losses,
                     entropy_losses,
+                    aux_losses,
                     approx_kl,
                 )
 
             (
                 (_rng, model_param, opt_state),
-                (losses, pg_losses, v_losses, entropy_losses, approx_kl),
+                (losses, pg_losses, v_losses, entropy_losses, aux_losses, approx_kl),
             ) = jax.lax.scan(
                 do_epoch, (rng, model_param, opt_state), jnp.arange(self.update_epochs)
             )
@@ -463,6 +497,7 @@ class ClassicMetaController:
             last_pg_loss = pg_losses[-1].mean()
             last_v_loss = v_losses[-1].mean()
             last_entropy_loss = entropy_losses[-1].mean()
+            last_aux_loss = aux_losses[-1].mean()
             return (
                 model_param,
                 opt_state,
@@ -470,6 +505,7 @@ class ClassicMetaController:
                 last_pg_loss,
                 last_v_loss,
                 last_entropy_loss,
+                last_aux_loss,
                 last_approx_kl,
             )
 
@@ -480,12 +516,13 @@ class ClassicMetaController:
             agent_pg_loss,
             agent_v_loss,
             agent_entropy_loss,
+            agent_aux_loss,
             last_approx_kl,
         ) = jax.vmap(process_agent)(
             jnp.arange(self.static_params.num_players),
             model_params,
             opt_states,
-            jax.random.split(rng, self.static_params.num_players)
+            jax.random.split(rng, self.static_params.num_players),
         )
 
         return (
@@ -498,6 +535,7 @@ class ClassicMetaController:
             agent_pg_loss,
             agent_v_loss,
             agent_entropy_loss,
+            agent_aux_loss,
             rewards.mean(axis=(0, 2)),
             last_approx_kl,
         )
@@ -506,11 +544,13 @@ class ClassicMetaController:
         if model_params is None:
             dummy_obs = (
                 jnp.ones(
-                    (self.num_steps, self.num_envs) + self.observation_space.spaces[0].shape  # pyright: ignore
+                    (self.num_steps, self.num_envs)
+                    + self.observation_space.spaces[0].shape  # pyright: ignore
                 ),
                 jnp.ones(
-                    (self.num_steps, self.num_envs) + self.observation_space.spaces[1].shape  # pyright: ignore
-                )
+                    (self.num_steps, self.num_envs)
+                    + self.observation_space.spaces[1].shape  # pyright: ignore
+                ),
             )
             dummy_lstm_state = (
                 jnp.ones((self.num_envs, 32)),
@@ -518,12 +558,18 @@ class ClassicMetaController:
             )
             dummy_done = jnp.ones((self.num_steps, self.num_envs))
             rng, _rng = jax.random.split(self.rng)
-            model_params = jax.vmap(self.agent.init, in_axes=(0, None, None, None))(
+            agent_params = jax.vmap(self.agent.init, in_axes=(0, None, None, None))(
                 jax.random.split(_rng, self.static_params.num_players),
                 dummy_obs,
                 dummy_lstm_state,
                 dummy_done,
             )
+            rng, _rng = jax.random.split(rng)
+            dummy_hidden = jnp.ones((self.num_steps, self.num_envs, 32))
+            aux_params = jax.vmap(self.aux.init, in_axes=(0, None))(
+                jax.random.split(_rng, self.static_params.num_players), dummy_hidden
+            )
+            model_params = (agent_params, aux_params)
         else:
             rng = self.rng
         opt_states = jax.vmap(self.optimizer.init)(model_params)
@@ -553,6 +599,7 @@ class ClassicMetaController:
                 agent_pg_loss,
                 agent_v_loss,
                 agent_entropy_loss,
+                agent_aux_loss,
                 rewards,
                 last_approx_kl,
             ) = self.train_some_episodes(
@@ -570,6 +617,7 @@ class ClassicMetaController:
             log.insert_stat(iteration, "pg_loss", agent_pg_loss)
             log.insert_stat(iteration, "v_loss", agent_v_loss)
             log.insert_stat(iteration, "entropy_loss", agent_entropy_loss)
+            log.insert_stat(iteration, "aux_loss", agent_aux_loss)
             if iteration % 20 == 0:
                 log.insert_model_snapshot(iteration, model_params)
             for agent in range(self.static_params.num_players):
@@ -577,6 +625,7 @@ class ClassicMetaController:
                 print("Agent", agent, "PG loss:", agent_pg_loss[agent])
                 print("Agent", agent, "value loss:", agent_v_loss[agent])
                 print("Agent", agent, "entropy:", agent_entropy_loss[agent])
+                print("Agent", agent, "auxillary loss:", agent_aux_loss[agent])
                 print("Agent", agent, "reward:", rewards[agent])
                 print("Agent", agent, "approx KL:", last_approx_kl[agent], flush=True)
         return model_params, opt_states, log
@@ -623,12 +672,9 @@ class ClassicMetaController:
     class _Indexer:
         def __init__(self, obj):
             self.obj = obj
-        
+
         def __getitem__(self, val):
-            return jax.tree_util.tree_map(
-                lambda x: x[val],
-                self.obj
-            )
+            return jax.tree_util.tree_map(lambda x: x[val], self.obj)
 
     def _idx(self, obj):
         """
