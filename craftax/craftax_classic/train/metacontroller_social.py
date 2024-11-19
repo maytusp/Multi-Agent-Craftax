@@ -631,6 +631,7 @@ class ClassicMetaController:
         return model_params, opt_states, log
 
     def run_one_episode(self, model_params):
+        agent_params, _aux_params = model_params
         rng, _rng = jax.random.split(self.rng)
         next_obs, env_state = self.env.reset(_rng, self.env_params)
         next_done = jnp.zeros((self.static_params.num_players, 1), dtype=bool)
@@ -644,7 +645,7 @@ class ClassicMetaController:
         )
 
         def eval_agent(model_param, next_lstm_state, next_obs, next_done, rng):
-            logits, _value, next_lstm_state = self.agent.apply(  # pyright: ignore
+            logits, _value, _hidden, next_lstm_state = self.agent.apply(  # pyright: ignore
                 model_param, next_obs, next_lstm_state, next_done
             )
             action = jax.random.categorical(rng, logits).squeeze()
@@ -655,7 +656,7 @@ class ClassicMetaController:
             rng, _rng = jax.random.split(rng)
             states.append(env_state)
             agent_actions, agent_logits, next_lstm_states = eval_fn(
-                model_params,
+                agent_params,
                 next_lstm_states,
                 next_obs,
                 next_done,
