@@ -14,7 +14,7 @@ class Inventory:
     def generate_inventory(num_agents: int) -> "Inventory":
         # we can do this since arrays are immutable
         zero_array = jnp.zeros(num_agents, dtype=int)
-        return Inventory(*(zero_array for _ in range(12)))
+        return Inventory(*((zero_array,) * 12))
 
     wood: jnp.ndarray
     stone: jnp.ndarray

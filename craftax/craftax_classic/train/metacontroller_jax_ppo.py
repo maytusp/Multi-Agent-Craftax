@@ -66,6 +66,7 @@ class ClassicMetaController:
         ent_coef: float = 0.01,
         vf_coef: float = 0.5,
         max_grad_norm: float = 0.5,
+        fixed_timesteps: bool = False,
         # target_kl: float | None = None,
     ):
         """
@@ -90,6 +91,7 @@ class ClassicMetaController:
         - vf_coef: Value function coefficient
         - max_grad_norm: The maximum norm for gradient clipping
         - target_kl: target KL divergence threshold
+        - fixed_timesteps: Fix the number of timesteps per episode
         """
         self.static_params = static_parameters
         self.num_envs = num_envs
@@ -98,6 +100,7 @@ class ClassicMetaController:
         self.step_fn = jax.vmap(
             self.env.step, in_axes=(0, 0, 1, None), out_axes=(1, 0, 1, 1, 0)
         )
+        self.fixed_timesteps = fixed_timesteps
         self.reset_fn = jax.vmap(self.env.reset, in_axes=(0, None), out_axes=(1, 0))
         self.player_alive_check = jax.vmap(are_players_alive, out_axes=1)
         self.num_steps = num_steps
@@ -130,6 +133,11 @@ class ClassicMetaController:
         self.lr_schedule = optax.linear_schedule(
             self.learning_rate, 0.0, self.num_iterations
         )
+        self.timestep_schedule = optax.linear_schedule(
+            self.env_params.max_timesteps * 0.01,
+            self.env_params.max_timesteps,
+            round(self.num_iterations * 0.8)
+        )
 
     @partial(jax.jit, static_argnums=(0,))
     def train_some_episodes(
@@ -142,6 +150,10 @@ class ClassicMetaController:
             opt_states[1].hyperparams["learning_rate"] = jnp.full(  # pyright: ignore
                 self.static_params.num_players, self.lr_schedule(tick)
             )
+
+        env_params = self.env_params
+        if self.fixed_timesteps:
+            env_params = env_params.replace(max_timesteps=self.timestep_schedule(tick))  # pyright: ignore
 
         def rollout_step(carry, step):
             (
