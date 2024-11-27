@@ -9,7 +9,7 @@ import optax
 from flax.linen import initializers
 
 from craftax.craftax_classic.envs.craftax_state import EnvParams, StaticEnvParams
-from craftax.craftax_classic.envs.craftax_symbolic_env import CraftaxClassicSymbolicEnv
+from craftax.craftax_classic.envs.craftax_symbolic_env import CraftaxClassicSymbolicEnv, CraftaxClassicSymbolicEnvNoAutoReset
 from craftax.craftax_classic.game_logic import are_players_alive
 from craftax.craftax_classic.train.logger import TrainLogger
 
@@ -95,12 +95,15 @@ class ClassicMetaController:
         """
         self.static_params = static_parameters
         self.num_envs = num_envs
-        self.env = CraftaxClassicSymbolicEnv(self.static_params)
+        self.fixed_timesteps = fixed_timesteps
+        if fixed_timesteps:
+            self.env = CraftaxClassicSymbolicEnvNoAutoReset(self.static_params)
+        else:
+            self.env = CraftaxClassicSymbolicEnv(self.static_params)
         self.env_params = env_params
         self.step_fn = jax.vmap(
             self.env.step, in_axes=(0, 0, 1, None), out_axes=(1, 0, 1, 1, 0)
         )
-        self.fixed_timesteps = fixed_timesteps
         self.reset_fn = jax.vmap(self.env.reset, in_axes=(0, None), out_axes=(1, 0))
         self.player_alive_check = jax.vmap(are_players_alive, out_axes=1)
         self.num_steps = num_steps
@@ -199,6 +202,26 @@ class ClassicMetaController:
                 action.astype(int),
                 self.env_params,
             )
+
+            def reset_env(rng):
+                """Performs an environment reset"""
+                rng, _rng = jax.random.split(rng)
+                next_obs, env_state = self.reset_fn(
+                    jax.random.split(_rng, self.num_envs), self.env_params,
+                )
+                return next_obs, env_state, jnp.ones_like(next_done), rng
+
+            def do_nothing(rng):
+                return next_obs, env_state, next_done, rng
+
+            if self.fixed_timesteps:
+                next_obs, env_state, next_done, rng = jax.lax.cond(
+                    env_state.timestep[0] >= self.env_params.max_timesteps,
+                    reset_env,
+                    do_nothing,
+                    rng,
+                )
+
             next_done = next_done.astype(float)
             return (
                 next_obs,
@@ -552,6 +575,7 @@ if __name__ == "__main__":
         anneal_lr=False,
         learning_rate=2.5e-4,
         max_grad_norm=1.0,
+        fixed_timesteps=True,
     )
     params, opt_states, log = metacontroller.train()
     # states, actions, logits, rewards = metacontroller.run_one_episode(params)

@@ -8,7 +8,12 @@ import optax
 from flax.linen import initializers
 
 from craftax.craftax_classic.envs.craftax_state import EnvParams, StaticEnvParams
-from craftax.craftax_classic.envs.craftax_symbolic_env import CraftaxClassicSymbolicEnv, CraftaxClassicSymbolicEnvShareStats
+from craftax.craftax_classic.envs.craftax_symbolic_env import (
+    CraftaxClassicSymbolicEnv,
+    CraftaxClassicSymbolicEnvNoAutoReset,
+    CraftaxClassicSymbolicEnvShareStats,
+    CraftaxClassicSymbolicEnvShareStatsNoAutoReset,
+)
 from craftax.craftax_classic.game_logic import are_players_alive
 from craftax.craftax_classic.train.logger import TrainLogger
 from craftax.craftax_classic.train.nets import LSTM, ZNet
@@ -125,14 +130,18 @@ class ClassicMetaController:
         self.env_params = env_params
         self.timestep = self.env_params.max_timesteps
         self.observe_others = observe_others
-        # if self.fixed_timesteps:
-        #     self.env = CraftaxClassicSymbolicEnvNoAutoReset(self.static_params)
-        # else:
-        #     self.env = CraftaxClassicSymbolicEnv(self.static_params)
         if observe_others:
-            self.env = CraftaxClassicSymbolicEnvShareStats(self.static_params)
+            if fixed_timesteps:
+                self.env = CraftaxClassicSymbolicEnvShareStatsNoAutoReset(
+                    self.static_params
+                )
+            else:
+                self.env = CraftaxClassicSymbolicEnvShareStats(self.static_params)
         else:
-            self.env = CraftaxClassicSymbolicEnv(self.static_params)
+            if fixed_timesteps:
+                self.env = CraftaxClassicSymbolicEnvNoAutoReset(self.static_params)
+            else:
+                self.env = CraftaxClassicSymbolicEnv(self.static_params)
         self.step_fn = jax.vmap(
             self.env.step, in_axes=(0, 0, 1, None), out_axes=(1, 0, 1, 1, 0)
         )
@@ -171,7 +180,7 @@ class ClassicMetaController:
         self.timestep_schedule = optax.linear_schedule(
             self.env_params.max_timesteps * 0.01,
             self.env_params.max_timesteps,
-            round(self.num_iterations * 0.8)
+            round(self.num_iterations * 0.8),
         )
 
     @partial(jax.jit, static_argnums=(0,))
@@ -239,6 +248,28 @@ class ClassicMetaController:
                 action.astype(int),
                 env_params,
             )
+
+            def reset_env(rng):
+                """Performs an environment reset"""
+                rng, _rng = jax.random.split(rng)
+                next_obs, env_state = self.reset_fn(
+                    jax.random.split(_rng, self.num_envs), self.env_params
+                )
+                return next_obs, env_state, jnp.ones_like(next_done), rng
+
+            def do_nothing(rng):
+                return next_obs, env_state, next_done, rng
+            
+            if self.fixed_timesteps:
+                # All timesteps should be synchronized if fixed_timesteps
+                # therefore, they reset at the same time
+                next_obs, env_state, next_done, rng = jax.lax.cond(
+                    env_state.timestep[0] >= self.env_params.max_timesteps,
+                    reset_env,
+                    do_nothing,
+                    rng,
+                )
+
             next_done = next_done.astype(float)
             return (
                 next_obs,
@@ -481,7 +512,7 @@ class ClassicMetaController:
             jnp.arange(self.static_params.num_players),
             model_params,
             opt_states,
-            jax.random.split(rng, self.static_params.num_players)
+            jax.random.split(rng, self.static_params.num_players),
         )
 
         return (
@@ -503,11 +534,13 @@ class ClassicMetaController:
             if self.observe_others:
                 dummy_obs = (
                     jnp.ones(
-                        (self.num_steps, self.num_envs) + self.observation_space.spaces[0].shape  # pyright: ignore
+                        (self.num_steps, self.num_envs)
+                        + self.observation_space.spaces[0].shape  # pyright: ignore
                     ),
                     jnp.ones(
-                        (self.num_steps, self.num_envs) + self.observation_space.spaces[1].shape  # pyright: ignore
-                    )
+                        (self.num_steps, self.num_envs)
+                        + self.observation_space.spaces[1].shape  # pyright: ignore
+                    ),
                 )
             else:
                 dummy_obs = jnp.ones(
@@ -625,13 +658,10 @@ class ClassicMetaController:
         def __init__(self, obj, observe_others: bool):
             self.obj = obj
             self.observe_others = observe_others
-        
+
         def __getitem__(self, val):
             if self.observe_others:
-                return jax.tree_util.tree_map(
-                    lambda x: x[val],
-                    self.obj
-                )
+                return jax.tree_util.tree_map(lambda x: x[val], self.obj)
             return self.obj[val]
 
     def _idx(self, obj):
