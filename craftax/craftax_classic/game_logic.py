@@ -424,7 +424,7 @@ def do_action(rng, state, action, static_params):
     rng, _rng = jax.random.split(rng)
     is_mining_sapling = jnp.logical_and(
         state.map[block_position[:, 0], block_position[:, 1]] == BlockType.GRASS.value,
-        jax.random.uniform(_rng) < 0.1,
+        jax.random.uniform(_rng, shape=(state.player_position.shape[0],)) < 0.1,
     )
     is_mining_sapling = jnp.logical_and(is_mining_sapling, is_do)
 
