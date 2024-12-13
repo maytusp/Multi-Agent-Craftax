@@ -25,15 +25,25 @@ from craftax.craftax_classic.world_gen import generate_world
 from craftax.environment_base.environment_bases import EnvironmentNoAutoReset
 
 
-def get_map_obs_shape():
-    num_mobs = 5
+def get_map_obs_shape(observe_others: bool = False, num_players: None | int = None):
+    """
+    Returns the map shape of the symbolic environment.
+    If observe_others is true, num_players is needed.
+    """
+    if observe_others and num_players is None:
+        raise Exception("num_players must not be None if observe_others")
+    num_mobs = 4 + num_players if observe_others else 5  # pyright: ignore
     num_blocks = len(BlockType)
 
     return OBS_DIM[0], OBS_DIM[1], num_blocks + num_mobs
 
 
-def get_flat_map_obs_shape():
-    map_obs_shape = get_map_obs_shape()
+def get_flat_map_obs_shape(observe_others: bool = False, num_players: None | int = None):
+    """
+    Returns the flattened map observation shape. If observe_others is true,
+    num_players is needed.
+    """
+    map_obs_shape = get_map_obs_shape(observe_others, num_players)
     return map_obs_shape[0] * map_obs_shape[1] * map_obs_shape[2]
 
 
@@ -258,7 +268,7 @@ class CraftaxClassicSymbolicEnvShareStats(CraftaxClassicSymbolicEnv):
         return "Craftax-Classic-Symbolic-ShareStats-v1"
 
     def observation_space(self, params: EnvParams) -> spaces.Tuple:
-        flat_map_obs_shape = get_flat_map_obs_shape()
+        flat_map_obs_shape = get_flat_map_obs_shape(True, self.static_env_params.num_players)
         direction = 4
         light_level = 1
         is_alive = 1
@@ -367,7 +377,7 @@ class CraftaxClassicSymbolicEnvShareStatsNoAutoReset(
         return "Craftax-Classic-Symbolic-ShareStats-NoAutoReset-v1"
 
     def observation_space(self, params: EnvParams) -> spaces.Tuple:
-        flat_map_obs_shape = get_flat_map_obs_shape()
+        flat_map_obs_shape = get_flat_map_obs_shape(True, self.static_env_params.num_players)
         direction = 4
         light_level = 1
         is_alive = 1

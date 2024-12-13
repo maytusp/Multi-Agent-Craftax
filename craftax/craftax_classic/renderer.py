@@ -28,7 +28,11 @@ def render_craftax_symbolic(state, player=0, observe_others=False):
     map_view_one_hot = jax.nn.one_hot(map_view, num_classes=len(BlockType))
 
     # Mobs
-    mob_map = jnp.zeros((*OBS_DIM, 5), dtype=jnp.uint8)  # 4 types of mobs
+    if observe_others:
+        # one hot encode players
+        mob_map = jnp.zeros((*OBS_DIM, 4 + state.player_position.shape[0]), dtype=jnp.uint8)
+    else:
+        mob_map = jnp.zeros((*OBS_DIM, 5), dtype=jnp.uint8)  # 4 types of mobs
 
     def _add_mob_to_map(carry, mob_index):
         mob_map, mobs, mob_type_index = carry
@@ -82,7 +86,7 @@ def render_craftax_symbolic(state, player=0, observe_others=False):
             ).all()
             on_screen *= mask[player_idx]
 
-            mob_map = mob_map.at[local_position[0], local_position[1], 4].set(
+            mob_map = mob_map.at[local_position[0], local_position[1], 4 + player_idx].set(
                 # We will have the player idx here
                 (player_idx * on_screen).astype(jnp.uint8)
             )

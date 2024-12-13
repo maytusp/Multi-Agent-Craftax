@@ -1,11 +1,14 @@
-from typing import Any
-from dataclasses import asdict
-import wandb
 import os
+from dataclasses import asdict
+from typing import Any
+
+import wandb
+
 from craftax.craftax_classic.envs.craftax_state import EnvParams, StaticEnvParams
 
 
 class TrainLogger:
+    train_params: dict[str, Any]
     env_params: EnvParams
     static_env_params: StaticEnvParams
     model_snapshots: list[tuple[int, Any]]
@@ -13,8 +16,13 @@ class TrainLogger:
     wandb_project: str
 
     def __init__(
-        self, env_params: EnvParams, static_env_params: StaticEnvParams, wandb_project: str = ''
+        self,
+        train_params: dict[str, Any],
+        env_params: EnvParams,
+        static_env_params: StaticEnvParams,
+        wandb_project: str = "",
     ) -> None:
+        self.train_params = train_params
         self.env_params = env_params
         self.static_env_params = static_env_params
         self.model_snapshots = []
@@ -24,15 +32,14 @@ class TrainLogger:
             os.environ["WANDB_MODE"] = "online"
             os.environ["WANDB_PROJECT"] = wandb_project
 
-            config = {**asdict(env_params), **asdict(static_env_params)}
+            config = {**train_params, **asdict(env_params), **asdict(static_env_params)}
             wandb.init(project=wandb_project, config=config)
-            
+
             print("CONFIG")
             print(wandb.config)
 
             wandb.define_metric("train/episode")
             wandb.define_metric("train/*", step_metric="train/episode")
-
 
     def insert_model_snapshot(self, iteration: int, model: Any) -> None:
         self.model_snapshots.append((iteration, model))
@@ -44,10 +51,13 @@ class TrainLogger:
         """
         if self.wandb_project:
             # TODO: double check if wandb will plot the data properly
-            wandb.log({
-                'train/episode': iteration, 
-                **{f'train/{key}/agent_{i}': value for i, value in enumerate(data)}
-                }, step=iteration)
+            wandb.log(
+                {
+                    "train/episode": iteration,
+                    **{f"train/{key}/agent_{i}": value for i, value in enumerate(data)},
+                },
+                step=iteration,
+            )
         elif key in self.stats:
             self.stats[key].append((iteration, data))
         else:

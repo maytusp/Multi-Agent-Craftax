@@ -171,6 +171,10 @@ class ClassicMetaController:
         self.max_grad_norm = max_grad_norm
         # self.target_kl = target_kl
         self.num_iterations = num_iterations
+        # Save the training configuration as a dict
+        self.config = dict(vars(self))
+        for unwanted in ("env_params", "static_params", "env", "step_fn", "reset_fn", "player_alive_check"):
+            del self.config[unwanted]
 
         self.agent = CraftaxAgent(self.action_space.n)
         self.aux = AuxLossNet(
@@ -597,7 +601,7 @@ class ClassicMetaController:
         opt_states = jax.vmap(self.optimizer.init)(model_params)
 
         # Logger
-        log = TrainLogger(self.env_params, self.static_params)
+        log = TrainLogger(self.config, self.env_params, self.static_params)
 
         # initialize environment
         rng, _rng = jax.random.split(rng)
