@@ -5,6 +5,8 @@ import jax.random
 from flax import struct
 import jax.numpy as jnp
 
+from craftax.craftax_classic.constants import Achievement
+
 
 @struct.dataclass
 class Inventory:
@@ -141,6 +143,9 @@ class EnvParams:
 
     god_mode: bool = False
     """Turn this on to not die lol"""
+
+    achievement_weights = jnp.ones(len(Achievement))
+    """If reward shaping is needed, adjust weights for different achievements"""
 
 
 @struct.dataclass
