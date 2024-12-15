@@ -3,6 +3,7 @@ from dataclasses import asdict
 from typing import Any
 
 import wandb
+import pickle
 
 from craftax.craftax_classic.envs.craftax_state import EnvParams, StaticEnvParams
 
@@ -42,7 +43,12 @@ class TrainLogger:
             wandb.define_metric("train/*", step_metric="train/episode")
 
     def insert_model_snapshot(self, iteration: int, model: Any) -> None:
-        self.model_snapshots.append((iteration, model))
+        if self.wandb_project:
+            file_name = f'model_iter_{iteration}.pickle'
+            with open(os.path.join(wandb.run.dir, file_name), 'wb') as f:
+                pickle.dump(model, f)
+        else:
+            self.model_snapshots.append((iteration, model))
 
     def insert_stat(self, iteration: int, key: str, data: Any) -> None:
         """
