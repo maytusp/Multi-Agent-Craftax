@@ -475,7 +475,7 @@ class ClassicMetaController:
                 - self.ent_coef * entropy_loss
                 + v_loss * self.vf_coef
                 + aux_loss * self.aux_coef
-                + mean_proximity * self.proximity_bonus
+                - mean_proximity * self.proximity_bonus
             )
             return loss, (
                 pg_loss,
