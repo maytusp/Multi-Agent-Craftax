@@ -107,7 +107,7 @@ class ClassicMetaController:
         clip_vloss: bool = True,
         ent_coef: float = 0.01,
         vf_coef: float = 0.5,
-        proximity_bonus: float = 0.01,
+        proximity_bonus: float = 0.1,
         aux_coef: float = 0.3,
         max_grad_norm: float = 0.5,
         # target_kl: float | None = None,

@@ -397,37 +397,6 @@ class CraftaxClassicSymbolicEnvShareStatsNoAutoReset(
 
         return spaces.Tuple([player_observations, other_player_status])
 
-    @functools.partial(jax.jit, static_argnums=(0,))
-    def step(
-        self,
-        key: chex.PRNGKey,
-        state: EnvState,
-        action: Union[int, float, chex.Array],
-        params: Optional[EnvParams] = None,
-    ) -> Tuple[
-        Tuple[chex.Array, chex.Array],
-        EnvState,
-        jnp.ndarray,
-        jnp.ndarray,
-        dict[Any, Any],
-    ]:
-        """Performs step transitions in the environment."""
-        # Use default env parameters if no others specified
-        if params is None:
-            params = self.default_params
-        key, key_reset = jax.random.split(key)
-        obs_st, state_st, reward, done, info = self.step_env(key, state, action, params)
-        obs_re, state_re = self.reset_env(key_reset, params)
-        # Auto-reset environment based on termination
-        all_done = jnp.all(done)
-        state = jax.tree_map(
-            lambda x, y: jax.lax.select(all_done, x, y), state_re, state_st
-        )
-        obs = jax.tree_util.tree_map(
-            lambda re, st: jax.lax.select(all_done, re, st), obs_re, obs_st
-        )
-        return obs, state, reward, done, info
-
     def get_obs(self, state: EnvState) -> Tuple[chex.Array, chex.Array]:
         """
         Returns a tuple
