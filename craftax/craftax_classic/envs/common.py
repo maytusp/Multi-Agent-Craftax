@@ -9,7 +9,7 @@ def compute_score(state: EnvState, done: Array):
     info = {}
     for achievement in Achievement:
         name = f"Achievements/{achievement.name.lower()}"
-        info[name] = achievements[achievement.value]
+        info[name] = achievements[:, achievement.value]
 
     for inventory in fields(Inventory):
         info["Inventory/" + inventory.name] = getattr(state.inventory, inventory.name)
