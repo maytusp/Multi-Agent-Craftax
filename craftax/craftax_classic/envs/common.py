@@ -25,5 +25,5 @@ def compute_score(state: EnvState, done: Array):
     info["fatigure"] = state.player_fatigue
 
     # Geometric mean with an offset of 1%
-    info["score"] = jnp.exp(jnp.mean(jnp.log(1 + achievements))) - 1.0
+    info["score"] = jnp.exp(jnp.mean(jnp.log(1 + achievements), axis=1)) - 1.0
     return info
