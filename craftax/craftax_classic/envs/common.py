@@ -5,10 +5,10 @@ from jax import Array
 
 
 def compute_score(state: EnvState, done: Array):
-    achievements = state.achievements * done.reshape(-1, 1) * 100.0
+    achievements = state.achievements
     info = {}
     for achievement in Achievement:
-        name = f"Achievements/{achievement.name.lower()}"
+        name = f"AlreadyAchieved/{achievement.name.lower()}"
         info[name] = achievements[:, achievement.value]
 
     for inventory in fields(Inventory):
