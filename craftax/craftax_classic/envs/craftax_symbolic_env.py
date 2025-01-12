@@ -32,7 +32,7 @@ def get_map_obs_shape(observe_others: bool = False, num_players: None | int = No
     """
     if observe_others and num_players is None:
         raise Exception("num_players must not be None if observe_others")
-    num_mobs = 4 + num_players if observe_others else 5  # pyright: ignore
+    num_mobs = 4 if observe_others else 5  # pyright: ignore
     num_blocks = len(BlockType)
 
     return OBS_DIM[0], OBS_DIM[1], num_blocks + num_mobs
@@ -56,6 +56,17 @@ def get_inventory_obs_shape():
     direction = 4
 
     return inv_size + num_intrinsics + light_level + is_sleeping + direction + is_alive
+
+def get_player_data_obs_shape(static_params):
+    """
+    Returns the observation shape of observing other players
+    """
+    map_size = OBS_DIM[0] * OBS_DIM[1]
+    inventory = 12
+    intrinsics = 5
+
+    return (static_params.num_players - 1, map_size + inventory + intrinsics)
+
 
 
 class CraftaxClassicSymbolicEnvNoAutoReset(EnvironmentNoAutoReset):
@@ -269,21 +280,19 @@ class CraftaxClassicSymbolicEnvShareStats(CraftaxClassicSymbolicEnv):
 
     def observation_space(self, params: EnvParams) -> spaces.Tuple:
         flat_map_obs_shape = get_flat_map_obs_shape(True, self.static_env_params.num_players)
-        direction = 4
-        light_level = 1
-        is_alive = 1
+        inventory_obs_shape = get_inventory_obs_shape()
 
-        obs_shape = flat_map_obs_shape + direction + light_level + is_alive
+        obs_shape = flat_map_obs_shape + inventory_obs_shape
 
         player_observations = spaces.Box(
             0.0,
-            self.static_env_params.num_players - 1,
+            1.0,
             (obs_shape,),
             dtype=jnp.float32,
         )
 
         other_player_status = spaces.Box(
-            0, 1, (self.static_env_params.num_players, 17), dtype=jnp.int32
+            0, 1, get_player_data_obs_shape(self.static_env_params), dtype=jnp.float16
         )
 
         return spaces.Tuple([player_observations, other_player_status])
@@ -323,39 +332,10 @@ class CraftaxClassicSymbolicEnvShareStats(CraftaxClassicSymbolicEnv):
         """
         Returns a tuple
         """
-        all_pixels = jax.vmap(render_craftax_symbolic, in_axes=(None, 0, None))(
+        self_obs, player_obs = jax.vmap(render_craftax_symbolic, in_axes=(None, 0, None))(
             state, jnp.arange(self.static_env_params.num_players), True
         )
-        all_inventories = jnp.repeat(
-            jnp.expand_dims(render_others_inventories(state), axis=0),
-            self.static_env_params.num_players,
-            axis=0,
-        )
-        within_observation = jax.vmap(
-            self._player_within_observation, in_axes=(None, 0)
-        )(state, jnp.arange(self.static_env_params.num_players))
-        all_inventories = jax.lax.select(
-            jnp.broadcast_to(within_observation[..., None], all_inventories.shape),
-            all_inventories,
-            jnp.zeros_like(all_inventories),
-        )
-        return (all_pixels, all_inventories)
-
-    def _player_within_observation(self, state: EnvState, player: int) -> jnp.bool:
-        """
-        Checks whether each player is within the observations of the current player
-        """
-        player_position = state.player_position[player]
-        local_position = (
-            state.player_position
-            - player_position
-            + jnp.array([OBS_DIM[0], OBS_DIM[1]]) // 2
-        )
-        on_screen = jnp.logical_and(
-            local_position >= 0, local_position < jnp.array([OBS_DIM[0], OBS_DIM[1]])
-        ).all(axis=1)
-        is_alive = are_players_alive(state)
-        return jnp.logical_and(on_screen, is_alive)
+        return (self_obs, player_obs)
 
 
 class CraftaxClassicSymbolicEnvShareStatsNoAutoReset(
@@ -378,21 +358,19 @@ class CraftaxClassicSymbolicEnvShareStatsNoAutoReset(
 
     def observation_space(self, params: EnvParams) -> spaces.Tuple:
         flat_map_obs_shape = get_flat_map_obs_shape(True, self.static_env_params.num_players)
-        direction = 4
-        light_level = 1
-        is_alive = 1
+        inventory_obs_shape = get_inventory_obs_shape()
 
-        obs_shape = flat_map_obs_shape + direction + light_level + is_alive
+        obs_shape = flat_map_obs_shape + inventory_obs_shape
 
         player_observations = spaces.Box(
             0.0,
-            self.static_env_params.num_players - 1,
+            1.0,
             (obs_shape,),
             dtype=jnp.float32,
         )
 
         other_player_status = spaces.Box(
-            0, 1, (self.static_env_params.num_players, 17), dtype=jnp.int32
+            0, 1, get_player_data_obs_shape(self.static_env_params), dtype=jnp.float16
         )
 
         return spaces.Tuple([player_observations, other_player_status])
@@ -401,36 +379,7 @@ class CraftaxClassicSymbolicEnvShareStatsNoAutoReset(
         """
         Returns a tuple
         """
-        all_pixels = jax.vmap(render_craftax_symbolic, in_axes=(None, 0, None))(
+        self_obs, player_obs = jax.vmap(render_craftax_symbolic, in_axes=(None, 0, None))(
             state, jnp.arange(self.static_env_params.num_players), True
         )
-        all_inventories = jnp.repeat(
-            jnp.expand_dims(render_others_inventories(state), axis=0),
-            self.static_env_params.num_players,
-            axis=0,
-        )
-        within_observation = jax.vmap(
-            self._player_within_observation, in_axes=(None, 0)
-        )(state, jnp.arange(self.static_env_params.num_players))
-        all_inventories = jax.lax.select(
-            jnp.broadcast_to(within_observation[..., None], all_inventories.shape),
-            all_inventories,
-            jnp.zeros_like(all_inventories),
-        )
-        return (all_pixels, all_inventories)
-
-    def _player_within_observation(self, state: EnvState, player: int) -> jnp.bool:
-        """
-        Checks whether each player is within the observations of the current player
-        """
-        player_position = state.player_position[player]
-        local_position = (
-            state.player_position
-            - player_position
-            + jnp.array([OBS_DIM[0], OBS_DIM[1]]) // 2
-        )
-        on_screen = jnp.logical_and(
-            local_position >= 0, local_position < jnp.array([OBS_DIM[0], OBS_DIM[1]])
-        ).all(axis=1)
-        is_alive = are_players_alive(state)
-        return jnp.logical_and(on_screen, is_alive)
+        return (self_obs, player_obs)

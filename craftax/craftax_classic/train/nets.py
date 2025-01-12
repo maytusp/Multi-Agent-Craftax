@@ -7,7 +7,7 @@ from flax.linen import initializers
 class ZNet(nn.Module):
     @nn.compact
     def __call__(self, x):
-        return nn.Sequential([nn.Dense(64), nn.relu, nn.Dense(12)])(x)
+        return nn.Dense(128)(x)
 
 class LSTM(nn.Module):
     features: int

@@ -1,8 +1,8 @@
 from functools import partial
 
 from craftax.craftax_classic.constants import *
-from craftax.craftax_classic.game_logic import are_players_alive
 from craftax.craftax_classic.envs.craftax_state import Mobs
+from craftax.craftax_classic.game_logic import are_players_alive
 
 
 def render_craftax_symbolic(state, player=0, observe_others=False):
@@ -30,9 +30,9 @@ def render_craftax_symbolic(state, player=0, observe_others=False):
     # Mobs
     if observe_others:
         # one hot encode players
-        mob_map = jnp.zeros((*OBS_DIM, 4 + state.player_position.shape[0]), dtype=jnp.uint8)
+        mob_map = jnp.zeros((*OBS_DIM, 4), dtype=jnp.uint8)  # 4 types of mobs
     else:
-        mob_map = jnp.zeros((*OBS_DIM, 5), dtype=jnp.uint8)  # 4 types of mobs
+        mob_map = jnp.zeros((*OBS_DIM, 5), dtype=jnp.uint8)  # 4 types of mobs + players
 
     def _add_mob_to_map(carry, mob_index):
         mob_map, mobs, mob_type_index = carry
@@ -71,33 +71,8 @@ def render_craftax_symbolic(state, player=0, observe_others=False):
         (mob_map, state.arrows, 3),
         jnp.arange(state.arrows.mask.shape[0]),
     )
-    if observe_others:
-        # add player ids to the last layer in mob_map
-        def _add_player_to_map(carry, player_idx):
-            mob_map, position, mask = carry
 
-            local_position = (
-                position[player_idx]
-                - state.player_position[player]
-                + jnp.array([OBS_DIM[0], OBS_DIM[1]]) // 2
-            )
-            on_screen = jnp.logical_and(
-                local_position >= 0, local_position < jnp.array([OBS_DIM[0], OBS_DIM[1]])
-            ).all()
-            on_screen *= mask[player_idx]
-
-            mob_map = mob_map.at[local_position[0], local_position[1], 4 + player_idx].set(
-                # We will have the player idx here
-                (player_idx * on_screen).astype(jnp.uint8)
-            )
-
-            return (mob_map, position, mask), None
-        (mob_map, _, _), _ = jax.lax.scan(
-            _add_player_to_map,
-            (mob_map, state.player_position, players_alive.at[player].set(False)),
-            jnp.arange(state.player_position.shape[0])
-        )
-    else:
+    if not observe_others:
         # Add other player positions to mob map
         players_as_mob = Mobs(
             position=state.player_position,
@@ -109,7 +84,7 @@ def render_craftax_symbolic(state, player=0, observe_others=False):
         (mob_map, _, _), _ = jax.lax.scan(
             _add_mob_to_map,
             (mob_map, players_as_mob, 4),
-            jnp.arange(state.player_position.shape[0])
+            jnp.arange(state.player_position.shape[0]),
         )
 
     all_map = jnp.concatenate([map_view_one_hot, mob_map], axis=-1)
@@ -117,18 +92,6 @@ def render_craftax_symbolic(state, player=0, observe_others=False):
     direction = jax.nn.one_hot(state.player_direction[player] - 1, num_classes=4)
 
     is_alive = players_alive[player]
-
-    if observe_others:
-        # No need to render inventory
-        # (they should be rendered with render_others_inventories)
-        all_flattened = jnp.concatenate(
-            [
-                all_map.flatten(),
-                direction,
-                jnp.array([state.light_level, is_alive])
-            ]
-        )
-        return all_flattened
 
     # Inventory
     inventory = (
@@ -173,10 +136,14 @@ def render_craftax_symbolic(state, player=0, observe_others=False):
         ]
     )
 
+    if observe_others:
+        # return auxillary data as well if we want to observe others
+        return all_flattened, render_others_data(state)
+
     return all_flattened
 
 
-@partial(jax.jit, static_argnums=(1,2))
+@partial(jax.jit, static_argnums=(1, 2))
 def render_craftax_pixels(state, block_pixel_size, num_players, player=0):
     textures = TEXTURES[block_pixel_size]
     obs_dim_array = jnp.array([OBS_DIM[0], OBS_DIM[1]], dtype=jnp.int32)
@@ -221,6 +188,7 @@ def render_craftax_pixels(state, block_pixel_size, num_players, player=0):
 
     # Render players
     player_alive = are_players_alive(state)
+
     def _render_player(i, map_pixels):
         old_map_pixels = map_pixels
         player_texture_index = jax.lax.select(
@@ -240,10 +208,14 @@ def render_craftax_pixels(state, block_pixel_size, num_players, player=0):
         #     + textures["full_map_player_textures"][player_texture_index]
         #     * textures["full_map_player_textures_alpha"][player_texture_index]
         # )
-        player_texture = textures["full_map_player_textures"][player_texture_index] * on_screen
+        player_texture = (
+            textures["full_map_player_textures"][player_texture_index] * on_screen
+        )
 
         player_texture_with_background = (
-            1 - textures["full_map_player_textures_alpha"][player_texture_index] * on_screen
+            1
+            - textures["full_map_player_textures_alpha"][player_texture_index]
+            * on_screen
         )
 
         player_texture_with_background = (
@@ -261,7 +233,8 @@ def render_craftax_pixels(state, block_pixel_size, num_players, player=0):
 
         player_texture_with_background = (
             player_texture_with_background
-            + player_texture * textures["full_map_player_textures_alpha"][player_texture_index]
+            + player_texture
+            * textures["full_map_player_textures_alpha"][player_texture_index]
         )
 
         map_pixels = jax.lax.dynamic_update_slice(
@@ -273,11 +246,7 @@ def render_craftax_pixels(state, block_pixel_size, num_players, player=0):
                 0,
             ),
         )
-        return jax.lax.select(
-            player_alive[i],
-            map_pixels,
-            old_map_pixels
-        )
+        return jax.lax.select(player_alive[i], map_pixels, old_map_pixels)
 
     map_pixels = jax.lax.fori_loop(0, num_players, _render_player, map_pixels)
     map_pixels = _render_player(player, map_pixels)
@@ -559,7 +528,9 @@ def render_craftax_pixels(state, block_pixel_size, num_players, player=0):
     sleep_pixels = (0.5 * sleep_pixels)[:, :, None] + (0.5 * jnp.array([0, 0, 16]))[
         None, None, :
     ]
-    map_pixels = (1 - state.is_sleeping[player]) * map_pixels + state.is_sleeping[player] * sleep_pixels
+    map_pixels = (1 - state.is_sleeping[player]) * map_pixels + state.is_sleeping[
+        player
+    ] * sleep_pixels
 
     # Render mob map
     # mob_map_pixels = (
@@ -620,8 +591,7 @@ def render_craftax_pixels(state, block_pixel_size, num_players, player=0):
     )
     inv_pixels = inv_pixels.at[
         inv_pixel_left_space : block_pixel_size - inv_pixel_right_space,
-        block_pixel_size
-        + inv_pixel_left_space : block_pixel_size * 2
+        block_pixel_size + inv_pixel_left_space : block_pixel_size * 2
         - inv_pixel_right_space,
     ].set(hunger_texture)
     inv_pixels = _render_number(inv_pixels, state.player_food[player], 1, 0)
@@ -633,8 +603,7 @@ def render_craftax_pixels(state, block_pixel_size, num_players, player=0):
     )
     inv_pixels = inv_pixels.at[
         inv_pixel_left_space : block_pixel_size - inv_pixel_right_space,
-        block_pixel_size * 2
-        + inv_pixel_left_space : block_pixel_size * 3
+        block_pixel_size * 2 + inv_pixel_left_space : block_pixel_size * 3
         - inv_pixel_right_space,
     ].set(thirst_texture)
     inv_pixels = _render_number(inv_pixels, state.player_drink[player], 2, 0)
@@ -646,8 +615,7 @@ def render_craftax_pixels(state, block_pixel_size, num_players, player=0):
     )
     inv_pixels = inv_pixels.at[
         inv_pixel_left_space : block_pixel_size - inv_pixel_right_space,
-        block_pixel_size * 3
-        + inv_pixel_left_space : block_pixel_size * 4
+        block_pixel_size * 3 + inv_pixel_left_space : block_pixel_size * 4
         - inv_pixel_right_space,
     ].set(energy_texture)
     inv_pixels = _render_number(inv_pixels, state.player_energy[player], 3, 0)
@@ -661,8 +629,7 @@ def render_craftax_pixels(state, block_pixel_size, num_players, player=0):
     )
     inv_pixels = inv_pixels.at[
         inv_pixel_left_space : block_pixel_size - inv_pixel_right_space,
-        block_pixel_size * 5
-        + inv_pixel_left_space : block_pixel_size * 6
+        block_pixel_size * 5 + inv_pixel_left_space : block_pixel_size * 6
         - inv_pixel_right_space,
     ].set(inv_wood_texture)
     inv_pixels = _render_number(inv_pixels, state.inventory.wood[player], 5, 0)
@@ -674,8 +641,7 @@ def render_craftax_pixels(state, block_pixel_size, num_players, player=0):
     )
     inv_pixels = inv_pixels.at[
         inv_pixel_left_space : block_pixel_size - inv_pixel_right_space,
-        block_pixel_size * 6
-        + inv_pixel_left_space : block_pixel_size * 7
+        block_pixel_size * 6 + inv_pixel_left_space : block_pixel_size * 7
         - inv_pixel_right_space,
     ].set(inv_stone_texture)
     inv_pixels = _render_number(inv_pixels, state.inventory.stone[player], 6, 0)
@@ -687,8 +653,7 @@ def render_craftax_pixels(state, block_pixel_size, num_players, player=0):
     )
     inv_pixels = inv_pixels.at[
         inv_pixel_left_space : block_pixel_size - inv_pixel_right_space,
-        block_pixel_size * 7
-        + inv_pixel_left_space : block_pixel_size * 8
+        block_pixel_size * 7 + inv_pixel_left_space : block_pixel_size * 8
         - inv_pixel_right_space,
     ].set(inv_coal_texture)
     inv_pixels = _render_number(inv_pixels, state.inventory.coal[player], 7, 0)
@@ -700,8 +665,7 @@ def render_craftax_pixels(state, block_pixel_size, num_players, player=0):
     )
     inv_pixels = inv_pixels.at[
         inv_pixel_left_space : block_pixel_size - inv_pixel_right_space,
-        block_pixel_size * 8
-        + inv_pixel_left_space : block_pixel_size * 9
+        block_pixel_size * 8 + inv_pixel_left_space : block_pixel_size * 9
         - inv_pixel_right_space,
     ].set(inv_iron_texture)
     inv_pixels = _render_number(inv_pixels, state.inventory.iron[player], 8, 0)
@@ -712,8 +676,7 @@ def render_craftax_pixels(state, block_pixel_size, num_players, player=0):
         textures["smaller_empty_texture"],
     )
     inv_pixels = inv_pixels.at[
-        block_pixel_size
-        + inv_pixel_left_space : 2 * block_pixel_size
+        block_pixel_size + inv_pixel_left_space : 2 * block_pixel_size
         - inv_pixel_right_space,
         inv_pixel_left_space : block_pixel_size - inv_pixel_right_space,
     ].set(inv_diamond_texture)
@@ -726,8 +689,7 @@ def render_craftax_pixels(state, block_pixel_size, num_players, player=0):
     )
     inv_pixels = inv_pixels.at[
         inv_pixel_left_space : block_pixel_size - inv_pixel_right_space,
-        block_pixel_size * 4
-        + inv_pixel_left_space : block_pixel_size * 5
+        block_pixel_size * 4 + inv_pixel_left_space : block_pixel_size * 5
         - inv_pixel_right_space,
     ].set(inv_sapling_texture)
     inv_pixels = _render_number(inv_pixels, state.inventory.sapling[player], 4, 0)
@@ -740,11 +702,9 @@ def render_craftax_pixels(state, block_pixel_size, num_players, player=0):
         textures["smaller_empty_texture"],
     )
     inv_pixels = inv_pixels.at[
-        block_pixel_size
-        + inv_pixel_left_space : block_pixel_size * 2
+        block_pixel_size + inv_pixel_left_space : block_pixel_size * 2
         - inv_pixel_right_space,
-        block_pixel_size
-        + inv_pixel_left_space : block_pixel_size * 2
+        block_pixel_size + inv_pixel_left_space : block_pixel_size * 2
         - inv_pixel_right_space,
     ].set(wooden_pickaxe_maybe_texture)
     inv_pixels = _render_number(inv_pixels, state.inventory.wood_pickaxe[player], 1, 1)
@@ -756,11 +716,9 @@ def render_craftax_pixels(state, block_pixel_size, num_players, player=0):
         textures["smaller_empty_texture"],
     )
     inv_pixels = inv_pixels.at[
-        block_pixel_size
-        + inv_pixel_left_space : block_pixel_size * 2
+        block_pixel_size + inv_pixel_left_space : block_pixel_size * 2
         - inv_pixel_right_space,
-        block_pixel_size * 2
-        + inv_pixel_left_space : block_pixel_size * 3
+        block_pixel_size * 2 + inv_pixel_left_space : block_pixel_size * 3
         - inv_pixel_right_space,
     ].set(stone_pickaxe_maybe_texture)
     inv_pixels = _render_number(inv_pixels, state.inventory.stone_pickaxe[player], 2, 1)
@@ -772,11 +730,9 @@ def render_craftax_pixels(state, block_pixel_size, num_players, player=0):
         textures["smaller_empty_texture"],
     )
     inv_pixels = inv_pixels.at[
-        block_pixel_size
-        + inv_pixel_left_space : block_pixel_size * 2
+        block_pixel_size + inv_pixel_left_space : block_pixel_size * 2
         - inv_pixel_right_space,
-        block_pixel_size * 3
-        + inv_pixel_left_space : block_pixel_size * 4
+        block_pixel_size * 3 + inv_pixel_left_space : block_pixel_size * 4
         - inv_pixel_right_space,
     ].set(iron_pickaxe_maybe_texture)
     inv_pixels = _render_number(inv_pixels, state.inventory.iron_pickaxe[player], 3, 1)
@@ -788,11 +744,9 @@ def render_craftax_pixels(state, block_pixel_size, num_players, player=0):
         textures["smaller_empty_texture"],
     )
     inv_pixels = inv_pixels.at[
-        block_pixel_size
-        + inv_pixel_left_space : block_pixel_size * 2
+        block_pixel_size + inv_pixel_left_space : block_pixel_size * 2
         - inv_pixel_right_space,
-        block_pixel_size * 4
-        + inv_pixel_left_space : block_pixel_size * 5
+        block_pixel_size * 4 + inv_pixel_left_space : block_pixel_size * 5
         - inv_pixel_right_space,
     ].set(wooden_sword_maybe_texture)
     inv_pixels = _render_number(inv_pixels, state.inventory.wood_sword[player], 4, 1)
@@ -804,11 +758,9 @@ def render_craftax_pixels(state, block_pixel_size, num_players, player=0):
         textures["smaller_empty_texture"],
     )
     inv_pixels = inv_pixels.at[
-        block_pixel_size
-        + inv_pixel_left_space : block_pixel_size * 2
+        block_pixel_size + inv_pixel_left_space : block_pixel_size * 2
         - inv_pixel_right_space,
-        block_pixel_size * 5
-        + inv_pixel_left_space : block_pixel_size * 6
+        block_pixel_size * 5 + inv_pixel_left_space : block_pixel_size * 6
         - inv_pixel_right_space,
     ].set(stone_sword_maybe_texture)
     inv_pixels = _render_number(inv_pixels, state.inventory.stone_sword[player], 5, 1)
@@ -820,11 +772,9 @@ def render_craftax_pixels(state, block_pixel_size, num_players, player=0):
         textures["smaller_empty_texture"],
     )
     inv_pixels = inv_pixels.at[
-        block_pixel_size
-        + inv_pixel_left_space : block_pixel_size * 2
+        block_pixel_size + inv_pixel_left_space : block_pixel_size * 2
         - inv_pixel_right_space,
-        block_pixel_size * 6
-        + inv_pixel_left_space : block_pixel_size * 7
+        block_pixel_size * 6 + inv_pixel_left_space : block_pixel_size * 7
         - inv_pixel_right_space,
     ].set(iron_sword_maybe_texture)
     inv_pixels = _render_number(inv_pixels, state.inventory.iron_sword[player], 6, 1)
@@ -837,32 +787,76 @@ def render_craftax_pixels(state, block_pixel_size, num_players, player=0):
 
     return pixels
 
+
 def render_others_inventories(state):
     """
     Renders the inventory of all players
     """
-    return jnp.stack(
-        [
-            state.inventory.wood,
-            state.inventory.stone,
-            state.inventory.coal,
-            state.inventory.iron,
-            state.inventory.diamond,
-            state.inventory.sapling,
-            state.inventory.wood_pickaxe,
-            state.inventory.stone_pickaxe,
-            state.inventory.iron_pickaxe,
-            state.inventory.wood_sword,
-            state.inventory.stone_sword,
-            state.inventory.iron_sword,
-            state.player_health,
-            state.player_food,
-            state.player_drink,
-            state.player_energy,
-            state.is_sleeping,
-        ],
-         axis=1,
-    ).astype(jnp.float16) / 10.0
+    return (
+        jnp.stack(
+            [
+                state.inventory.wood,
+                state.inventory.stone,
+                state.inventory.coal,
+                state.inventory.iron,
+                state.inventory.diamond,
+                state.inventory.sapling,
+                state.inventory.wood_pickaxe,
+                state.inventory.stone_pickaxe,
+                state.inventory.iron_pickaxe,
+                state.inventory.wood_sword,
+                state.inventory.stone_sword,
+                state.inventory.iron_sword,
+                state.player_health,
+                state.player_food,
+                state.player_drink,
+                state.player_energy,
+                state.is_sleeping,
+            ],
+            axis=1,
+        ).astype(jnp.float16)
+        / 10.0
+    )
+
+
+def render_others_data(state, player=0):
+    """
+    Renders other players in the perspective of player.
+    """
+
+    local_position = (
+        state.player_position
+        - state.player_position[player]
+        + jnp.array([OBS_DIM[0], OBS_DIM[1]]) // 2
+    )
+
+    on_screen = jnp.logical_and(
+        local_position >= 0, local_position < jnp.array([OBS_DIM[0], OBS_DIM[1]])
+    ).all(axis=1)
+    alive = are_players_alive(state)
+    show_player = jnp.logical_and(on_screen, alive)
+
+    player_map = jnp.zeros((state.player_position.shape[0],) + OBS_DIM, dtype=jnp.uint8)
+    player_map.at[
+        jnp.arange(state.player_position.shape[0]),
+        local_position[:, 0],
+        local_position[:, 1],
+    ].set(show_player)
+    player_map = jnp.delete(player_map, player, axis=0)
+    # reshape to (n_players-1, data)
+    player_map_flattened = player_map.reshape(state.player_position.shape[0] - 1, -1)
+
+    inventories = render_others_inventories(state)
+    filtered_inventories = jax.lax.select(
+        jnp.broadcast_to(show_player[..., None], inventories.shape),
+        inventories,
+        jnp.zeros_like(inventories),
+    )
+    filtered_inventories = jnp.delete(filtered_inventories, player, axis=0)
+    filtered_inventories_flattened = filtered_inventories.reshape(state.player_position.shape[0] - 1, -1)
+
+    return jnp.concat([player_map_flattened, filtered_inventories_flattened], axis=1)
+
 
 # def render_pixels_empty(block_pixel_size):
 #     pixels = jnp.zeros(

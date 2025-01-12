@@ -687,7 +687,7 @@ if __name__ == "__main__":
         anneal_lr=False,
         learning_rate=2.5e-4,
         max_grad_norm=1.0,
-        fixed_timesteps=True,
+        fixed_timesteps=False,
         observe_others=True,
     )
     params, opt_states, log = metacontroller.train()
@@ -710,4 +710,4 @@ if __name__ == "__main__":
     # rng_key = jax.random.PRNGKey(0)
     # params = model.init(rng_key, dummy_obs, dummy_lstm_state, dummy_done)
     # print(params)
-    # breakpoint()
+
