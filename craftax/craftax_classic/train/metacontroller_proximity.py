@@ -27,7 +27,7 @@ class AuxLossNet(nn.Module):
     def __call__(self, x):
         x = nn.Dense(64)(x)
         x = nn.relu(x)
-        x = nn.Dense(32)(x)
+        x = nn.Dense(64)(x)
         x = nn.relu(x)
         x = nn.Dense(self.output_size)(x)
         return x
