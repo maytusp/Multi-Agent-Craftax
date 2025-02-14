@@ -9,6 +9,7 @@ import numpy as np
 import optax
 from flax.linen import initializers
 
+from craftax.craftax_classic.constants import Action
 from craftax.craftax_classic.envs.craftax_state import EnvParams, StaticEnvParams
 from craftax.craftax_classic.envs.craftax_symbolic_env import (
     CraftaxClassicSymbolicEnvShareStats,
@@ -412,7 +413,9 @@ class ClassicMetaController:
                 lambda x: x.reshape(x.shape[:2] + (-1,)),
                 mb_future_obs,
             )
-            concat_future_obs = jnp.concatenate([reshaped_future_obs[0], reshaped_future_obs[1]], axis=2)
+            one_hot_actions = jax.nn.one_hot(mb_actions, len(Action))
+            concat_future_obs = jnp.concatenate([one_hot_actions, reshaped_future_obs[0], reshaped_future_obs[1]], axis=2)
+            # concat_future_obs = jnp.concatenate([reshaped_future_obs[0], reshaped_future_obs[1]], axis=2)
             aux_error = concat_future_obs - predicted_future_obs
             aux_loss = jnp.mean(jnp.square(aux_error))
 
