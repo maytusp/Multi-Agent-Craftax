@@ -180,7 +180,7 @@ class ClassicMetaController:
         self.agent = CraftaxAgent(self.action_space.n)
         self.aux = AuxLossNet(
             np.prod(self.observation_space.spaces[0].shape)  # pyright: ignore
-            + np.prod(self.observation_space.spaces[1].shape)  # pyright: ignore
+            + np.prod(self.observation_space.spaces[1].shape) + self.action_space.n  # pyright: ignore
         )
         self.optimizer = optax.chain(
             optax.clip_by_global_norm(self.max_grad_norm),
@@ -724,7 +724,7 @@ if __name__ == "__main__":
         anneal_lr=False,
         learning_rate=2.5e-4,
         max_grad_norm=1.0,
-        fixed_timesteps=True,
+        # fixed_timesteps=True,
     )
     params, opt_states, log = metacontroller.train()
     # states, actions, logits, rewards = metacontroller.run_one_episode(params)
