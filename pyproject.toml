@@ -32,7 +32,6 @@ dependencies = [
     "chex",
     "matplotlib",
     "imageio",
-    "wandb",
 ]
 
 [project.scripts]

@@ -64,8 +64,9 @@ def get_player_data_obs_shape(static_params):
     map_size = OBS_DIM[0] * OBS_DIM[1]
     inventory = 12
     intrinsics = 5
+    directions = 4
 
-    return (static_params.num_players - 1, map_size + inventory + intrinsics)
+    return (static_params.num_players - 1, map_size + inventory + intrinsics + directions)
 
 
 

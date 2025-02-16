@@ -1,6 +1,6 @@
 from functools import partial
 from random import randrange
-from typing import Sequence
+from typing import Sequence, cast
 
 import flax.linen as nn
 import jax
@@ -9,7 +9,7 @@ import numpy as np
 import optax
 from flax.linen import initializers
 
-from craftax.craftax_classic.constants import Action
+from craftax.craftax_classic.constants import OBS_DIM, Action
 from craftax.craftax_classic.envs.craftax_state import EnvParams, StaticEnvParams
 from craftax.craftax_classic.envs.craftax_symbolic_env import (
     CraftaxClassicSymbolicEnvShareStats,
@@ -25,9 +25,9 @@ class AuxLossNet(nn.Module):
 
     @nn.compact
     def __call__(self, x):
-        x = nn.Dense(64)(x)
+        x = nn.Dense(256)(x)
         x = nn.relu(x)
-        x = nn.Dense(64)(x)
+        x = nn.Dense(128)(x)
         x = nn.relu(x)
         x = nn.Dense(self.output_size)(x)
         return x
@@ -39,19 +39,19 @@ class CraftaxAgent(nn.Module):
     def setup(self):
         self.network = nn.Sequential(
             [
-                nn.Dense(64, kernel_init=initializers.orthogonal(jnp.sqrt(2))),
+                nn.Dense(512, kernel_init=initializers.orthogonal(jnp.sqrt(2))),
                 nn.relu,
-                nn.Dense(32, kernel_init=initializers.orthogonal(jnp.sqrt(2))),
+                nn.Dense(256, kernel_init=initializers.orthogonal(jnp.sqrt(2))),
                 nn.relu,
             ]
         )
-        self.actor_1 = nn.Dense(64, kernel_init=initializers.orthogonal(2))
+        self.actor_1 = nn.Dense(128, kernel_init=initializers.orthogonal(2))
         self.actor_out = nn.Dense(
             self.action_space, kernel_init=initializers.orthogonal(0.01)
         )
-        self.critic_1 = nn.Dense(64, kernel_init=initializers.orthogonal(2))
+        self.critic_1 = nn.Dense(128, kernel_init=initializers.orthogonal(2))
         self.critic_out = nn.Dense(1, kernel_init=initializers.orthogonal(1.0))
-        self.lstm = LSTM(32)
+        self.lstm = LSTM(256)
         self.znet = ZNet()
 
     def get_states(self, x, lstm_state, done):
@@ -142,7 +142,9 @@ class ClassicMetaController:
         self.env_params = env_params
         self.timestep = self.env_params.max_timesteps
         if fixed_timesteps:
-            self.env = CraftaxClassicSymbolicEnvShareStatsNoAutoReset(self.static_params)
+            self.env = CraftaxClassicSymbolicEnvShareStatsNoAutoReset(
+                self.static_params
+            )
         else:
             self.env = CraftaxClassicSymbolicEnvShareStats(self.static_params)
         self.step_fn = jax.vmap(
@@ -174,13 +176,20 @@ class ClassicMetaController:
         self.num_iterations = num_iterations
         # Save the training configuration as a dict
         self.config = dict(vars(self))
-        for unwanted in ("env_params", "static_params", "env", "step_fn", "reset_fn", "player_alive_check"):
+        for unwanted in (
+            "env_params",
+            "static_params",
+            "env",
+            "step_fn",
+            "reset_fn",
+            "player_alive_check",
+        ):
             del self.config[unwanted]
 
         self.agent = CraftaxAgent(self.action_space.n)
         self.aux = AuxLossNet(
             np.prod(self.observation_space.spaces[0].shape)  # pyright: ignore
-            + np.prod(self.observation_space.spaces[1].shape) + self.action_space.n  # pyright: ignore
+            + np.prod(self.observation_space.spaces[1].shape)  # pyright: ignore
         )
         self.optimizer = optax.chain(
             optax.clip_by_global_norm(self.max_grad_norm),
@@ -273,7 +282,7 @@ class ClassicMetaController:
 
             def do_nothing(rng):
                 return next_obs, env_state, next_done, rng
-            
+
             if self.fixed_timesteps:
                 # All timesteps should be synchronized if fixed_timesteps
                 # therefore, they reset at the same time
@@ -407,21 +416,45 @@ class ClassicMetaController:
                 v_loss = 0.5 * ((newvalue - mb_returns) ** 2).mean()
 
             # Auxillary Loss
-            # given the array of predicted accuracy, take the mean
-            predicted_future_obs = self.aux.apply(aux_params, hidden)
-            reshaped_future_obs = jax.tree_util.tree_map(
-                lambda x: x.reshape(x.shape[:2] + (-1,)),
-                mb_future_obs,
-            )
+            # Compute the auxillary loss by taking softmax except for inventory and intrinsics
             one_hot_actions = jax.nn.one_hot(mb_actions, len(Action))
-            concat_future_obs = jnp.concatenate([one_hot_actions, reshaped_future_obs[0], reshaped_future_obs[1]], axis=2)
-            # concat_future_obs = jnp.concatenate([reshaped_future_obs[0], reshaped_future_obs[1]], axis=2)
-            aux_error = concat_future_obs - predicted_future_obs
-            aux_loss = jnp.mean(jnp.square(aux_error))
+            aux_input = jnp.concatenate([one_hot_actions, hidden], axis=2)
+            predicted_future_obs = cast(
+                jax.Array, self.aux.apply(aux_params, aux_input)
+            )
+            # we stack 21 7*9 maps for each block and mob
+            # predictions of current player stats
+            # TODO: Maybe also use cross entropy on block maps?
+            pred_curr_player = predicted_future_obs[..., : mb_future_obs[0].shape[-1]]
+            true_curr_player = mb_future_obs[0]
+            player_pred_loss = jnp.mean(jnp.square(pred_curr_player - true_curr_player))
+            pred_other_player = predicted_future_obs[
+                ..., -np.prod(self.observation_space.spaces[1].shape) :  # pyright: ignore
+            ].reshape(mb_future_obs[1].shape)
+            # map error is treated as a categorical cross entropy problem
+            pred_other_player_map = pred_other_player[..., : np.prod(OBS_DIM)]
+            true_other_player_map = mb_future_obs[1][..., : np.prod(OBS_DIM)]
+            location_loss = optax.losses.softmax_cross_entropy(
+                pred_other_player_map, true_other_player_map
+            )
+            location_loss = jnp.sum(location_loss)
+
+            pred_other_player_intrinsics = pred_other_player[..., np.prod(OBS_DIM)]
+            true_other_player_intrinsics = mb_future_obs[1][..., np.prod(OBS_DIM)]
+            other_player_intrinsics_loss = jnp.mean(
+                jnp.square(pred_other_player_intrinsics - true_other_player_intrinsics)
+            )
+
+            aux_loss = player_pred_loss + location_loss + other_player_intrinsics_loss
 
             # Entropy Loss
             entropy_loss = entropy.mean()
-            loss = pg_loss - self.ent_coef * entropy_loss + v_loss * self.vf_coef + aux_loss * self.aux_coef
+            loss = (
+                pg_loss
+                - self.ent_coef * entropy_loss
+                + v_loss * self.vf_coef
+                + aux_loss * self.aux_coef
+            )
             return loss, (
                 pg_loss,
                 v_loss,
@@ -472,7 +505,10 @@ class ClassicMetaController:
                         lambda state: state[agent_idx, mbenvinds], init_lstm_states
                     )
 
-                    (loss, (pg_loss, v_loss, entropy_loss, aux_loss, approx_kl)), grads = grad_fn(
+                    (
+                        (loss, (pg_loss, v_loss, entropy_loss, aux_loss, approx_kl)),
+                        grads,
+                    ) = grad_fn(
                         model_param,
                         mb_obs,
                         mb_future_obs,
@@ -499,7 +535,14 @@ class ClassicMetaController:
 
                 (
                     (model_param, optimizer_state),
-                    (losses, pg_losses, v_losses, entropy_losses, aux_losses, approx_kl),
+                    (
+                        losses,
+                        pg_losses,
+                        v_losses,
+                        entropy_losses,
+                        aux_losses,
+                        approx_kl,
+                    ),
                 ) = jax.lax.scan(
                     do_minibatch,
                     (model_param, optimizer_state),
@@ -582,8 +625,8 @@ class ClassicMetaController:
                 ),
             )
             dummy_lstm_state = (
-                jnp.ones((self.num_envs, 32)),
-                jnp.ones((self.num_envs, 32)),
+                jnp.ones((self.num_envs, 256)),
+                jnp.ones((self.num_envs, 256)),
             )
             dummy_done = jnp.ones((self.num_steps, self.num_envs))
             rng, _rng = jax.random.split(self.rng)
@@ -594,9 +637,16 @@ class ClassicMetaController:
                 dummy_done,
             )
             rng, _rng = jax.random.split(rng)
-            dummy_hidden = jnp.ones((self.num_steps, self.num_envs, 32))
+            dummy_hidden = jnp.ones((self.num_steps, self.num_envs, 256))
             aux_params = jax.vmap(self.aux.init, in_axes=(0, None))(
-                jax.random.split(_rng, self.static_params.num_players), dummy_hidden
+                jax.random.split(_rng, self.static_params.num_players),
+                jnp.concatenate(
+                    [
+                        dummy_hidden,
+                        jnp.zeros((self.num_steps, self.num_envs, self.action_space.n)),
+                    ],
+                    axis=2,
+                ),
             )
             model_params = (agent_params, aux_params)
         else:
@@ -612,8 +662,8 @@ class ClassicMetaController:
             jax.random.split(_rng, self.num_envs), self.env_params
         )
         next_lstm_states = (
-            jnp.zeros((self.static_params.num_players, self.num_envs, 32)),
-            jnp.zeros((self.static_params.num_players, self.num_envs, 32)),
+            jnp.zeros((self.static_params.num_players, self.num_envs, 256)),
+            jnp.zeros((self.static_params.num_players, self.num_envs, 256)),
         )
         for iteration in range(self.num_iterations):
             print("Iteration", iteration)
@@ -669,8 +719,8 @@ class ClassicMetaController:
         logits = []
         rewards = []
         next_lstm_states = (
-            jnp.zeros((self.static_params.num_players, 1, 32)),
-            jnp.zeros((self.static_params.num_players, 1, 32)),
+            jnp.zeros((self.static_params.num_players, 1, 256)),
+            jnp.zeros((self.static_params.num_players, 1, 256)),
         )
 
         def eval_agent(model_param, next_lstm_state, next_obs, next_done, rng):
