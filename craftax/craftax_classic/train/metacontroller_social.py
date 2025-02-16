@@ -1,6 +1,5 @@
 from functools import partial
-from random import randrange
-from typing import Sequence, cast
+from typing import cast
 
 import flax.linen as nn
 import jax
@@ -9,11 +8,12 @@ import numpy as np
 import optax
 from flax.linen import initializers
 
-from craftax.craftax_classic.constants import OBS_DIM, Action
+from craftax.craftax_classic.constants import OBS_DIM, Action, BlockType
 from craftax.craftax_classic.envs.craftax_state import EnvParams, StaticEnvParams
 from craftax.craftax_classic.envs.craftax_symbolic_env import (
     CraftaxClassicSymbolicEnvShareStats,
     CraftaxClassicSymbolicEnvShareStatsNoAutoReset,
+    get_flat_map_obs_shape,
 )
 from craftax.craftax_classic.game_logic import are_players_alive
 from craftax.craftax_classic.train.logger import TrainLogger
@@ -425,12 +425,50 @@ class ClassicMetaController:
             # we stack 21 7*9 maps for each block and mob
             # predictions of current player stats
             # TODO: Maybe also use cross entropy on block maps?
-            pred_curr_player = predicted_future_obs[..., : mb_future_obs[0].shape[-1]]
-            true_curr_player = mb_future_obs[0]
-            player_pred_loss = jnp.mean(jnp.square(pred_curr_player - true_curr_player))
+            map_offset = get_flat_map_obs_shape(True, self.static_params.num_players)
+            pred_curr_player_map = predicted_future_obs[..., :map_offset].reshape(
+                predicted_future_obs.shape[:-1] + OBS_DIM + (-1,)
+            )
+            true_curr_player_map = mb_future_obs[0][..., :map_offset].reshape(
+                mb_future_obs[0].shape[:-1] + OBS_DIM + (-1,)
+            )
+            pred_block_map = pred_curr_player_map[..., : len(BlockType)]
+            true_block_map = true_curr_player_map[..., : len(BlockType)]
+            block_map_loss = jnp.sum(
+                optax.losses.softmax_cross_entropy(pred_block_map, true_block_map)
+            )
+            # Represents other maps of curr player, which can overlap, so it is not one-hot
+            pred_map_other = pred_curr_player_map[..., len(BlockType) :].reshape(
+                predicted_future_obs.shape[:-1] + (-1,)
+            )
+            # prediction of rest of player info
+            pred_curr_player_rest = jnp.concatenate(
+                [
+                    pred_map_other,
+                    predicted_future_obs[..., map_offset : mb_future_obs[0].shape[-1]],
+                ],
+                axis=-1,
+            )
+            true_map_other = true_curr_player_map[..., len(BlockType) :].reshape(
+                mb_future_obs[0].shape[:-1] + (-1,)
+            )
+            true_curr_player_rest = jnp.concatenate(
+                [
+                    true_map_other,
+                    mb_future_obs[0][..., map_offset : mb_future_obs[0].shape[-1]],
+                ],
+                axis=-1,
+            )
+            player_stat_loss = jnp.mean(
+                jnp.square(pred_curr_player_rest - true_curr_player_rest)
+            )
+            player_loss = block_map_loss + player_stat_loss
+
             pred_other_player = predicted_future_obs[
                 ..., -np.prod(self.observation_space.spaces[1].shape) :  # pyright: ignore
             ].reshape(mb_future_obs[1].shape)
+
+            # Computation of loss predicting other players
             # map error is treated as a categorical cross entropy problem
             pred_other_player_map = pred_other_player[..., : np.prod(OBS_DIM)]
             true_other_player_map = mb_future_obs[1][..., : np.prod(OBS_DIM)]
@@ -445,7 +483,7 @@ class ClassicMetaController:
                 jnp.square(pred_other_player_intrinsics - true_other_player_intrinsics)
             )
 
-            aux_loss = player_pred_loss + location_loss + other_player_intrinsics_loss
+            aux_loss = player_loss + location_loss + other_player_intrinsics_loss
 
             # Entropy Loss
             entropy_loss = entropy.mean()
