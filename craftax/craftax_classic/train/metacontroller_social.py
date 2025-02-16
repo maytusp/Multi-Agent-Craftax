@@ -434,8 +434,10 @@ class ClassicMetaController:
             )
             pred_block_map = pred_curr_player_map[..., : len(BlockType)]
             true_block_map = true_curr_player_map[..., : len(BlockType)]
-            block_map_loss = jnp.sum(
-                optax.losses.softmax_cross_entropy(pred_block_map, true_block_map)
+            block_map_loss = jnp.mean(
+                jnp.sum(
+                    optax.losses.softmax_cross_entropy(pred_block_map, true_block_map)
+                )
             )
             # Represents other maps of curr player, which can overlap, so it is not one-hot
             pred_map_other = pred_curr_player_map[..., len(BlockType) :].reshape(
@@ -475,7 +477,7 @@ class ClassicMetaController:
             location_loss = optax.losses.softmax_cross_entropy(
                 pred_other_player_map, true_other_player_map
             )
-            location_loss = jnp.sum(location_loss)
+            location_loss = jnp.mean(jnp.sum(location_loss))
 
             pred_other_player_intrinsics = pred_other_player[..., np.prod(OBS_DIM)]
             true_other_player_intrinsics = mb_future_obs[1][..., np.prod(OBS_DIM)]
