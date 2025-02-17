@@ -442,7 +442,6 @@ class ClassicMetaController:
                         )
                     )
                 )
-                * 1e-6
             )
             # Represents other maps of curr player, which can overlap, so it is not one-hot
             pred_map_other = pred_curr_player_map[..., len(BlockType) :].reshape(
@@ -469,7 +468,7 @@ class ClassicMetaController:
             player_stat_loss = jnp.mean(
                 jnp.square(pred_curr_player_rest - true_curr_player_rest)
             )
-            player_loss = block_map_loss + player_stat_loss
+            player_loss = block_map_loss * 1e-7 + player_stat_loss
 
             pred_other_player = predicted_future_obs[
                 ..., -np.prod(self.observation_space.spaces[1].shape) :  # pyright: ignore
@@ -492,7 +491,6 @@ class ClassicMetaController:
                         pred_other_player_intrinsics - true_other_player_intrinsics
                     )
                 )
-                * 1e-3
             )
 
             aux_loss = player_loss + location_loss + other_player_intrinsics_loss

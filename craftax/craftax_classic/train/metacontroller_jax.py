@@ -26,19 +26,19 @@ class CraftaxAgent(nn.Module):
     def setup(self):
         self.network = nn.Sequential(
             [
-                nn.Dense(64, kernel_init=initializers.orthogonal(jnp.sqrt(2))),
+                nn.Dense(512, kernel_init=initializers.orthogonal(jnp.sqrt(2))),
                 nn.relu,
-                nn.Dense(32, kernel_init=initializers.orthogonal(jnp.sqrt(2))),
+                nn.Dense(256, kernel_init=initializers.orthogonal(jnp.sqrt(2))),
                 nn.relu,
             ]
         )
-        self.actor_1 = nn.Dense(64, kernel_init=initializers.orthogonal(2))
+        self.actor_1 = nn.Dense(128, kernel_init=initializers.orthogonal(2))
         self.actor_out = nn.Dense(
             self.action_space, kernel_init=initializers.orthogonal(0.01)
         )
-        self.critic_1 = nn.Dense(64, kernel_init=initializers.orthogonal(2))
+        self.critic_1 = nn.Dense(128, kernel_init=initializers.orthogonal(2))
         self.critic_out = nn.Dense(1, kernel_init=initializers.orthogonal(1.0))
-        self.lstm = LSTM(32)
+        self.lstm = LSTM(256)
         self.znet = ZNet()
 
     def get_states(self, x, lstm_state, done):
@@ -551,8 +551,8 @@ class ClassicMetaController:
                     (self.num_steps, self.num_envs) + self.observation_space.shape  # pyright: ignore
                 )
             dummy_lstm_state = (
-                jnp.ones((self.num_envs, 32)),
-                jnp.ones((self.num_envs, 32)),
+                jnp.ones((self.num_envs, 256)),
+                jnp.ones((self.num_envs, 256)),
             )
             dummy_done = jnp.ones((self.num_steps, self.num_envs))
             rng, _rng = jax.random.split(self.rng)
@@ -575,8 +575,8 @@ class ClassicMetaController:
             jax.random.split(_rng, self.num_envs), self.env_params
         )
         next_lstm_states = (
-            jnp.zeros((self.static_params.num_players, self.num_envs, 32)),
-            jnp.zeros((self.static_params.num_players, self.num_envs, 32)),
+            jnp.zeros((self.static_params.num_players, self.num_envs, 256)),
+            jnp.zeros((self.static_params.num_players, self.num_envs, 256)),
         )
         for iteration in range(self.num_iterations):
             print("Iteration", iteration)
@@ -628,8 +628,8 @@ class ClassicMetaController:
         logits = []
         rewards = []
         next_lstm_states = (
-            jnp.zeros((self.static_params.num_players, 1, 32)),
-            jnp.zeros((self.static_params.num_players, 1, 32)),
+            jnp.zeros((self.static_params.num_players, 1, 256)),
+            jnp.zeros((self.static_params.num_players, 1, 256)),
         )
 
         def eval_agent(model_param, next_lstm_state, next_obs, next_done, rng):
