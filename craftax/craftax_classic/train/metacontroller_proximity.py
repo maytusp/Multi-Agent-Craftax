@@ -506,7 +506,7 @@ class ClassicMetaController:
             player_stat_loss = jnp.mean(
                 jnp.square(pred_curr_player_rest - true_curr_player_rest)
             )
-            player_loss = block_map_loss * 1e-7 + player_stat_loss
+            player_loss = block_map_loss * player_stat_loss
 
             pred_other_player = predicted_future_obs[
                 ..., -np.prod(self.observation_space.spaces[1].shape) :  # pyright: ignore

@@ -14,7 +14,7 @@ class EnvironmentNoAutoReset(object):
     def default_params(self):
         return NotImplementedError
 
-    @partial(jax.jit, static_argnums=(0, 4))
+    @partial(jax.jit, static_argnums=(0,))
     def step(
         self,
         key: chex.PRNGKey,
