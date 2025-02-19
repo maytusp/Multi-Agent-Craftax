@@ -1,6 +1,6 @@
 from functools import partial
 from random import randrange
-from typing import Sequence
+from typing import Sequence, cast
 
 import flax.linen as nn
 import jax
@@ -9,11 +9,12 @@ import numpy as np
 import optax
 from flax.linen import initializers
 
-from craftax.craftax_classic.constants import OBS_DIM
+from craftax.craftax_classic.constants import OBS_DIM, Action, BlockType
 from craftax.craftax_classic.envs.craftax_state import EnvParams, StaticEnvParams
 from craftax.craftax_classic.envs.craftax_symbolic_env import (
     CraftaxClassicSymbolicEnvShareStats,
     CraftaxClassicSymbolicEnvShareStatsNoAutoReset,
+    get_flat_map_obs_shape,
 )
 from craftax.craftax_classic.game_logic import are_players_alive
 from craftax.craftax_classic.train.logger import TrainLogger
@@ -25,9 +26,9 @@ class AuxLossNet(nn.Module):
 
     @nn.compact
     def __call__(self, x):
-        x = nn.Dense(64)(x)
+        x = nn.Dense(256)(x)
         x = nn.relu(x)
-        x = nn.Dense(64)(x)
+        x = nn.Dense(256)(x)
         x = nn.relu(x)
         x = nn.Dense(self.output_size)(x)
         return x
@@ -39,19 +40,19 @@ class CraftaxAgent(nn.Module):
     def setup(self):
         self.network = nn.Sequential(
             [
-                nn.Dense(64, kernel_init=initializers.orthogonal(jnp.sqrt(2))),
+                nn.Dense(512, kernel_init=initializers.orthogonal(jnp.sqrt(2))),
                 nn.relu,
-                nn.Dense(32, kernel_init=initializers.orthogonal(jnp.sqrt(2))),
+                nn.Dense(256, kernel_init=initializers.orthogonal(jnp.sqrt(2))),
                 nn.relu,
             ]
         )
-        self.actor_1 = nn.Dense(64, kernel_init=initializers.orthogonal(2))
+        self.actor_1 = nn.Dense(128, kernel_init=initializers.orthogonal(2))
         self.actor_out = nn.Dense(
             self.action_space, kernel_init=initializers.orthogonal(0.01)
         )
-        self.critic_1 = nn.Dense(64, kernel_init=initializers.orthogonal(2))
+        self.critic_1 = nn.Dense(128, kernel_init=initializers.orthogonal(2))
         self.critic_out = nn.Dense(1, kernel_init=initializers.orthogonal(1.0))
-        self.lstm = LSTM(32)
+        self.lstm = LSTM(256)
         self.znet = ZNet()
 
     def get_states(self, x, lstm_state, done):
@@ -453,17 +454,84 @@ class ClassicMetaController:
                 v_loss = 0.5 * ((newvalue - mb_returns) ** 2).mean()
 
             # Auxillary Loss
-            # given the array of predicted accuracy, take the mean
-            predicted_future_obs = self.aux.apply(aux_params, hidden)
-            reshaped_future_obs = jax.tree_util.tree_map(
-                lambda x: x.reshape(x.shape[:2] + (-1,)),
-                mb_future_obs,
+            # Compute the auxillary loss by taking softmax except for inventory and intrinsics
+            one_hot_actions = jax.nn.one_hot(mb_actions, len(Action))
+            aux_input = jnp.concatenate([one_hot_actions, hidden], axis=2)
+            predicted_future_obs = cast(
+                jax.Array, self.aux.apply(aux_params, aux_input)
             )
-            concat_future_obs = jnp.concatenate(
-                [reshaped_future_obs[0], reshaped_future_obs[1]], axis=2
+            # we stack 21 7*9 maps for each block and mob
+            # predictions of current player stats
+            # TODO: Maybe also use cross entropy on block maps?
+            map_offset = get_flat_map_obs_shape(True, self.static_params.num_players)
+            pred_curr_player_map = predicted_future_obs[..., :map_offset].reshape(
+                predicted_future_obs.shape[:-1] + OBS_DIM + (-1,)
             )
-            aux_error = concat_future_obs - predicted_future_obs
-            aux_loss = jnp.mean(jnp.square(aux_error))
+            true_curr_player_map = mb_future_obs[0][..., :map_offset].reshape(
+                mb_future_obs[0].shape[:-1] + OBS_DIM + (-1,)
+            )
+            pred_block_map = pred_curr_player_map[..., : len(BlockType)]
+            true_block_map = true_curr_player_map[..., : len(BlockType)]
+            block_map_loss = (
+                jnp.mean(
+                    jnp.sum(
+                        optax.losses.softmax_cross_entropy(
+                            pred_block_map, true_block_map
+                        )
+                    )
+                )
+            )
+            # Represents other maps of curr player, which can overlap, so it is not one-hot
+            pred_map_other = pred_curr_player_map[..., len(BlockType) :].reshape(
+                predicted_future_obs.shape[:-1] + (-1,)
+            )
+            # prediction of rest of player info
+            pred_curr_player_rest = jnp.concatenate(
+                [
+                    pred_map_other,
+                    predicted_future_obs[..., map_offset : mb_future_obs[0].shape[-1]],
+                ],
+                axis=-1,
+            )
+            true_map_other = true_curr_player_map[..., len(BlockType) :].reshape(
+                mb_future_obs[0].shape[:-1] + (-1,)
+            )
+            true_curr_player_rest = jnp.concatenate(
+                [
+                    true_map_other,
+                    mb_future_obs[0][..., map_offset : mb_future_obs[0].shape[-1]],
+                ],
+                axis=-1,
+            )
+            player_stat_loss = jnp.mean(
+                jnp.square(pred_curr_player_rest - true_curr_player_rest)
+            )
+            player_loss = block_map_loss * 1e-7 + player_stat_loss
+
+            pred_other_player = predicted_future_obs[
+                ..., -np.prod(self.observation_space.spaces[1].shape) :  # pyright: ignore
+            ].reshape(mb_future_obs[1].shape)
+
+            # Computation of loss predicting other players
+            # map error is treated as a categorical cross entropy problem
+            pred_other_player_map = pred_other_player[..., : np.prod(OBS_DIM)]
+            true_other_player_map = mb_future_obs[1][..., : np.prod(OBS_DIM)]
+            location_loss = optax.losses.softmax_cross_entropy(
+                pred_other_player_map, true_other_player_map
+            )
+            location_loss = jnp.mean(jnp.sum(location_loss))
+
+            pred_other_player_intrinsics = pred_other_player[..., np.prod(OBS_DIM)]
+            true_other_player_intrinsics = mb_future_obs[1][..., np.prod(OBS_DIM)]
+            other_player_intrinsics_loss = (
+                jnp.mean(
+                    jnp.square(
+                        pred_other_player_intrinsics - true_other_player_intrinsics
+                    )
+                )
+            )
+
+            aux_loss = player_loss + location_loss + other_player_intrinsics_loss
 
             # Proximity bonus
             mean_proximity = mb_proximity.astype(float).mean()
@@ -676,8 +744,8 @@ class ClassicMetaController:
                 ),
             )
             dummy_lstm_state = (
-                jnp.ones((self.num_envs, 32)),
-                jnp.ones((self.num_envs, 32)),
+                jnp.ones((self.num_envs, 256)),
+                jnp.ones((self.num_envs, 256)),
             )
             dummy_done = jnp.ones((self.num_steps, self.num_envs))
             rng, _rng = jax.random.split(self.rng)
@@ -688,9 +756,16 @@ class ClassicMetaController:
                 dummy_done,
             )
             rng, _rng = jax.random.split(rng)
-            dummy_hidden = jnp.ones((self.num_steps, self.num_envs, 32))
+            dummy_hidden = jnp.ones((self.num_steps, self.num_envs, 256))
             aux_params = jax.vmap(self.aux.init, in_axes=(0, None))(
-                jax.random.split(_rng, self.static_params.num_players), dummy_hidden
+                jax.random.split(_rng, self.static_params.num_players),
+                jnp.concatenate(
+                    [
+                        dummy_hidden,
+                        jnp.zeros((self.num_steps, self.num_envs, self.action_space.n)),
+                    ],
+                    axis=2,
+                ),
             )
             model_params = (agent_params, aux_params)
         else:
@@ -706,8 +781,8 @@ class ClassicMetaController:
             jax.random.split(_rng, self.num_envs), self.env_params
         )
         next_lstm_states = (
-            jnp.zeros((self.static_params.num_players, self.num_envs, 32)),
-            jnp.zeros((self.static_params.num_players, self.num_envs, 32)),
+            jnp.zeros((self.static_params.num_players, self.num_envs, 256)),
+            jnp.zeros((self.static_params.num_players, self.num_envs, 256)),
         )
         for iteration in range(self.num_iterations):
             print("Iteration", iteration)
@@ -766,8 +841,8 @@ class ClassicMetaController:
         logits = []
         rewards = []
         next_lstm_states = (
-            jnp.zeros((self.static_params.num_players, 1, 32)),
-            jnp.zeros((self.static_params.num_players, 1, 32)),
+            jnp.zeros((self.static_params.num_players, 1, 256)),
+            jnp.zeros((self.static_params.num_players, 1, 256)),
         )
 
         def eval_agent(model_param, next_lstm_state, next_obs, next_done, rng):
