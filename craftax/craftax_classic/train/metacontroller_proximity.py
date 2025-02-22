@@ -402,7 +402,6 @@ class ClassicMetaController:
             mb_advantages,
             mb_returns,
             mb_values,
-            mb_proximity,
             init_lstm_state,
         ):
             agent_params, aux_params = model_params
@@ -441,19 +440,16 @@ class ClassicMetaController:
             # Value loss
             newvalue = jnp.squeeze(newvalue, axis=-1)  # pyright: ignore
 
-            # use proximity
-            returns_with_proximity = mb_returns + self.proximity_bonus * mb_proximity
-
             if self.clip_vloss:
-                v_loss_unclipped = (newvalue - returns_with_proximity) ** 2
+                v_loss_unclipped = (newvalue - mb_returns) ** 2
                 v_clipped = mb_values + jax.lax.clamp(
                     -self.clip_coef, newvalue - mb_values, self.clip_coef
                 )
-                v_loss_clipped = (v_clipped - returns_with_proximity) ** 2
+                v_loss_clipped = (v_clipped - mb_returns) ** 2
                 v_loss_max = jnp.maximum(v_loss_unclipped, v_loss_clipped)
                 v_loss = 0.5 * v_loss_max.mean()
             else:
-                v_loss = 0.5 * ((newvalue - returns_with_proximity) ** 2).mean()
+                v_loss = 0.5 * ((newvalue - mb_returns) ** 2).mean()
 
             # Auxillary Loss
             # Compute the auxillary loss by taking softmax except for inventory and intrinsics
@@ -616,7 +612,6 @@ class ClassicMetaController:
                         mb_advantages,
                         mb_returns,
                         mb_values,
-                        mb_proximity,
                         init_lstm_state,
                     )
                     updates, optimizer_state = self.optimizer.update(
@@ -629,7 +624,6 @@ class ClassicMetaController:
                         v_loss,
                         entropy_loss,
                         aux_loss,
-                        mb_proximity.mean(),
                         approx_kl,
                     )
 
@@ -641,7 +635,6 @@ class ClassicMetaController:
                         v_losses,
                         entropy_losses,
                         aux_losses,
-                        mean_proximity,
                         approx_kl,
                     ),
                 ) = jax.lax.scan(
@@ -656,7 +649,6 @@ class ClassicMetaController:
                     v_losses,
                     entropy_losses,
                     aux_losses,
-                    mean_proximity,
                     approx_kl,
                 )
 
@@ -668,7 +660,6 @@ class ClassicMetaController:
                     v_losses,
                     entropy_losses,
                     aux_losses,
-                    mean_proximity,
                     approx_kl,
                 ),
             ) = jax.lax.scan(
@@ -680,7 +671,6 @@ class ClassicMetaController:
             last_v_loss = v_losses[-1].mean()
             last_entropy_loss = entropy_losses[-1].mean()
             last_aux_loss = aux_losses[-1].mean()
-            last_mean_proximity = mean_proximity[-1].mean()
             return (
                 model_param,
                 opt_state,
@@ -689,7 +679,6 @@ class ClassicMetaController:
                 last_v_loss,
                 last_entropy_loss,
                 last_aux_loss,
-                last_mean_proximity,
                 last_approx_kl,
             )
 
@@ -701,7 +690,6 @@ class ClassicMetaController:
             agent_v_loss,
             agent_entropy_loss,
             agent_aux_loss,
-            agent_mean_proximity,
             last_approx_kl,
         ) = jax.vmap(process_agent)(
             jnp.arange(self.static_params.num_players),
@@ -721,7 +709,7 @@ class ClassicMetaController:
             agent_v_loss,
             agent_entropy_loss,
             agent_aux_loss,
-            agent_mean_proximity,
+            can_see_others.mean(axis=(0,2)),
             rewards.mean(axis=(0, 2)),
             last_approx_kl,
         )
