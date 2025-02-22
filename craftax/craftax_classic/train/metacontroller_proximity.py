@@ -402,6 +402,7 @@ class ClassicMetaController:
             mb_advantages,
             mb_returns,
             mb_values,
+            mb_proximity,
             init_lstm_state,
         ):
             agent_params, aux_params = model_params
@@ -440,16 +441,19 @@ class ClassicMetaController:
             # Value loss
             newvalue = jnp.squeeze(newvalue, axis=-1)  # pyright: ignore
 
+            # use proximity
+            returns_with_proximity = mb_returns + self.proximity_bonus * mb_proximity
+
             if self.clip_vloss:
-                v_loss_unclipped = (newvalue - mb_returns) ** 2
+                v_loss_unclipped = (newvalue - returns_with_proximity) ** 2
                 v_clipped = mb_values + jax.lax.clamp(
                     -self.clip_coef, newvalue - mb_values, self.clip_coef
                 )
-                v_loss_clipped = (v_clipped - mb_returns) ** 2
+                v_loss_clipped = (v_clipped - returns_with_proximity) ** 2
                 v_loss_max = jnp.maximum(v_loss_unclipped, v_loss_clipped)
                 v_loss = 0.5 * v_loss_max.mean()
             else:
-                v_loss = 0.5 * ((newvalue - mb_returns) ** 2).mean()
+                v_loss = 0.5 * ((newvalue - returns_with_proximity) ** 2).mean()
 
             # Auxillary Loss
             # Compute the auxillary loss by taking softmax except for inventory and intrinsics
@@ -612,6 +616,7 @@ class ClassicMetaController:
                         mb_advantages,
                         mb_returns,
                         mb_values,
+                        mb_proximity,
                         init_lstm_state,
                     )
                     updates, optimizer_state = self.optimizer.update(
