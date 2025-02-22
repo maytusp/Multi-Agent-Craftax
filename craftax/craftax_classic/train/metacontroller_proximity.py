@@ -288,7 +288,7 @@ class ClassicMetaController:
 
             can_see_others = jax.vmap(within_view)(
                 jnp.arange(self.static_params.num_players)
-            )
+            ).astype(float)
 
             def reset_env(rng):
                 """Performs an environment reset"""
@@ -386,7 +386,7 @@ class ClassicMetaController:
         _, advantages = jax.lax.scan(
             compute_advantages,
             (jnp.zeros_like(next_done), next_values, next_done),
-            (dones, values, rewards),
+            (dones, values, rewards + self.proximity_bonus * can_see_others),
             reverse=True,
         )
         returns = advantages + values
@@ -402,7 +402,6 @@ class ClassicMetaController:
             mb_advantages,
             mb_returns,
             mb_values,
-            mb_proximity,
             init_lstm_state,
         ):
             agent_params, aux_params = model_params
@@ -526,8 +525,8 @@ class ClassicMetaController:
             # aux_loss = player_loss + location_loss + other_player_intrinsics_loss
             aux_loss = location_loss + other_player_intrinsics_loss
 
-            # Proximity bonus
-            mean_proximity = mb_proximity.astype(float).mean()
+            # Proximity bonus (added to reward)
+            # mean_proximity = mb_proximity.astype(float).mean()
 
             # Entropy Loss
             entropy_loss = entropy.mean()
@@ -536,14 +535,14 @@ class ClassicMetaController:
                 - self.ent_coef * entropy_loss
                 + v_loss * self.vf_coef
                 + aux_loss * self.aux_coef
-                - mean_proximity * self.proximity_bonus
+                # - mean_proximity * self.proximity_bonus
             )
             return loss, (
                 pg_loss,
                 v_loss,
                 entropy_loss,
                 aux_loss,
-                mean_proximity,
+                # mean_proximity,
                 jax.lax.stop_gradient(approx_kl),
             )
 
@@ -599,7 +598,6 @@ class ClassicMetaController:
                                 v_loss,
                                 entropy_loss,
                                 aux_loss,
-                                mean_proximity,
                                 approx_kl,
                             ),
                         ),
@@ -614,7 +612,6 @@ class ClassicMetaController:
                         mb_advantages,
                         mb_returns,
                         mb_values,
-                        mb_proximity,
                         init_lstm_state,
                     )
                     updates, optimizer_state = self.optimizer.update(
@@ -627,7 +624,7 @@ class ClassicMetaController:
                         v_loss,
                         entropy_loss,
                         aux_loss,
-                        mean_proximity,
+                        mb_proximity.mean(),
                         approx_kl,
                     )
 
