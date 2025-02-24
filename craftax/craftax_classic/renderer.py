@@ -837,7 +837,7 @@ def render_others_data(state, player=0):
     show_player = jnp.logical_and(on_screen, alive)
 
     player_map = jnp.zeros((state.player_position.shape[0],) + OBS_DIM, dtype=jnp.uint8)
-    player_map.at[
+    player_map = player_map.at[
         jnp.arange(state.player_position.shape[0]),
         local_position[:, 0],
         local_position[:, 1],
