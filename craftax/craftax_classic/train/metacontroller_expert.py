@@ -94,6 +94,7 @@ class ClassicMetaController:
         num_envs: int = 8,
         num_steps: int = 300,
         fixed_timesteps: bool = False,
+        quick_reset: bool = False,
         num_iterations: int = 100,
         learning_rate: float = 2.5e-3,
         anneal_lr: bool = True,
@@ -123,6 +124,7 @@ class ClassicMetaController:
         - num_steps: Number of steps to take for each batch. Note that this can be less than
             the actual number of steps used for training since the agent can be dead for some steps
         - fixed_timesteps: Fix the number of timesteps per episode
+        - quick_reset: Reset environment as soon as learner is dead
         - num_iterations: Number of rollout/training iterations
         - learning_rate: learning rate
         - anneal_lr: whether to anneal learning rate
@@ -142,9 +144,12 @@ class ClassicMetaController:
         self.static_params = static_parameters
         self.num_envs = num_envs
         self.fixed_timesteps = fixed_timesteps
+        self.quick_reset = quick_reset
         self.env_params = env_params
         self.timestep = self.env_params.max_timesteps
-        if fixed_timesteps:
+        if fixed_timesteps and quick_reset:
+            raise Exception("Cannot set both fixed_timesteps and quick_reset")
+        if fixed_timesteps or quick_reset:
             self.env = CraftaxClassicSymbolicEnvShareStatsNoAutoReset(
                 self.static_params
             )
@@ -223,7 +228,9 @@ class ClassicMetaController:
         rng, _rng = jax.random.split(rng)
         agent_params, _aux_params = learner_params
         concatenated_agent_params = jax.tree_util.tree_map(
-            lambda a, b: jnp.concatenate([jnp.expand_dims(a, 0), b], axis=0), agent_params, expert_params
+            lambda a, b: jnp.concatenate([jnp.expand_dims(a, 0), b], axis=0),
+            agent_params,
+            expert_params,
         )
         next_done = jnp.zeros((self.static_params.num_players, self.num_envs))
         init_lstm_states = next_lstm_states
@@ -302,18 +309,17 @@ class ClassicMetaController:
             # Only need to check non-expert
             player_can_see_others = within_view(0)
 
-            def reset_env(rng):
-                """Performs an environment reset"""
-                rng, _rng = jax.random.split(rng)
-                next_obs, env_state = self.reset_fn(
-                    jax.random.split(_rng, self.num_envs), self.env_params
-                )
-                return next_obs, env_state, jnp.ones_like(next_done), rng
-
-            def do_nothing(rng):
-                return next_obs, env_state, next_done, rng
-
             if self.fixed_timesteps:
+                def reset_env(rng):
+                    """Performs an environment reset"""
+                    rng, _rng = jax.random.split(rng)
+                    next_obs, env_state = self.reset_fn(
+                        jax.random.split(_rng, self.num_envs), self.env_params
+                    )
+                    return next_obs, env_state, jnp.ones_like(next_done), rng
+
+                def do_nothing(rng):
+                    return next_obs, env_state, next_done, rng
                 # All timesteps should be synchronized if fixed_timesteps
                 # therefore, they reset at the same time
                 next_obs, env_state, next_done, rng = jax.lax.cond(
@@ -321,6 +327,30 @@ class ClassicMetaController:
                     reset_env,
                     do_nothing,
                     rng,
+                )
+
+            elif self.quick_reset:
+                rng, _rng = jax.random.split(rng)
+                reset_obs, reset_state = self.reset_fn(
+                    jax.random.split(_rng, self.num_envs), self.env_params
+                )
+                next_obs = jax.tree_util.tree_map(
+                    lambda next_obs, reset_obs: jnp.where(
+                        next_done[0].reshape((1, next_done.shape[1]) + (1,) * (len(next_obs.shape) - 2)),
+                        next_obs,
+                        reset_obs,
+                    ),
+                    next_obs,
+                    reset_obs,
+                )
+                env_state = jax.tree_util.tree_map(
+                    lambda env_state, reset_state: jnp.where(
+                        next_done[0],
+                        env_state,
+                        reset_state,
+                    ),
+                    env_state,
+                    reset_state,
                 )
 
             next_done = next_done.astype(float)
@@ -390,7 +420,10 @@ class ClassicMetaController:
             )
 
         next_values = produce_value(
-            agent_params, self._idx(next_obs)[0], self._idx(next_lstm_states)[0], next_done[0]
+            agent_params,
+            self._idx(next_obs)[0],
+            self._idx(next_lstm_states)[0],
+            next_done[0],
         ).reshape(self.num_envs)
 
         def compute_advantages(carry, transition):
@@ -730,10 +763,10 @@ class ClassicMetaController:
             can_see_others.mean(),
             rewards.mean(),
             last_approx_kl,
-            expert_rewards.mean(axis=(0,2))
+            expert_rewards.mean(axis=(0, 2)),
         )
 
-    def train(self, expert_params, model_params=None):
+    def train(self, expert_params, model_params=None, model_opt_params=None):
         if model_params is None:
             dummy_obs = (
                 jnp.ones(
@@ -772,7 +805,11 @@ class ClassicMetaController:
             model_params = (agent_params, aux_params)
         else:
             rng = self.rng
-        opt_states = self.optimizer.init(model_params)
+        
+        if model_opt_params is None:
+            opt_states = self.optimizer.init(model_params)
+        else:
+            opt_states = model_opt_params
 
         # Logger
         log = TrainLogger(self.config, self.env_params, self.static_params)
@@ -894,10 +931,10 @@ class ClassicMetaController:
 if __name__ == "__main__":
     import pickle
 
-    with open("/Users/ericye/code/craftax_tests/ippo_large_params.p", "rb") as f:
+    with open("/Users/ericye/code/craftax_tests/params-ippo-v4.p", "rb") as f:
         expert_params = pickle.load(f)
     # keep first 3 agents
-    expert_params = jax.tree_util.tree_map(lambda x: x[:3], expert_params)
+    expert_params = jax.tree_util.tree_map(lambda x: x[1:], expert_params)
     metacontroller = ClassicMetaController(
         static_parameters=StaticEnvParams(num_players=4),
         num_envs=10,
@@ -909,6 +946,7 @@ if __name__ == "__main__":
         learning_rate=2.5e-4,
         max_grad_norm=1.0,
         fixed_timesteps=False,
+        quick_reset=True,
         proximity_bonus=0.0,
     )
     params, opt_states, log = metacontroller.train(expert_params)
