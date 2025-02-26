@@ -110,6 +110,7 @@ class ClassicMetaController:
         proximity_bonus: float = 0.1,
         aux_coef: float = 0.3,
         max_grad_norm: float = 0.5,
+        expert_drop_out: float = 10000,
         # target_kl: float | None = None,
     ):
         """
@@ -140,6 +141,7 @@ class ClassicMetaController:
         - aux_coef: Auxillary loss coefficient
         - max_grad_norm: The maximum norm for gradient clipping
         - target_kl: target KL divergence threshold
+        - expert_drop_out: Threshold to remove experts halfway into the episode
         """
         self.static_params = static_parameters
         self.num_envs = num_envs
@@ -161,6 +163,7 @@ class ClassicMetaController:
         self.reset_fn = jax.vmap(self.env.reset, in_axes=(0, None), out_axes=(1, 0))
         self.player_alive_check = jax.vmap(are_players_alive, out_axes=1)
         self.num_steps = num_steps
+        self.expert_drop_out = expert_drop_out
         # self.rng = jax.random.PRNGKey(randrange(2**31))
         self.rng = jax.random.PRNGKey(56)
         self.observation_space = self.env.observation_space(env_params)
@@ -286,12 +289,31 @@ class ClassicMetaController:
                 concatenated_agent_params,
                 next_lstm_states,
             )
+            # set action of experts to noop if experts should drop out
+            action = action.at[1:].set(
+                jnp.where(
+                    jnp.expand_dims(env_state.timestep >= self.expert_drop_out, 0),
+                    jnp.zeros_like(action[1:]),
+                    action[1:],
+                )
+            )
             rng, _rng = jax.random.split(rng)
             next_obs, env_state, reward, next_done, _info = self.step_fn(
                 jax.random.split(_rng, self.num_envs),
                 env_state,
                 action.astype(int),
                 env_params,
+            )
+            # zero out second part of observations if experts should be removed
+            next_obs = (
+                next_obs[0],
+                jnp.where(
+                    jnp.expand_dims(
+                        env_state.timestep >= self.expert_drop_out, (0, 2, 3)
+                    ),
+                    jnp.zeros_like(next_obs[1]),
+                    next_obs[1],
+                ),
             )
 
             # check if player is within view
@@ -310,6 +332,7 @@ class ClassicMetaController:
             player_can_see_others = within_view(0)
 
             if self.fixed_timesteps:
+
                 def reset_env(rng):
                     """Performs an environment reset"""
                     rng, _rng = jax.random.split(rng)
@@ -320,6 +343,7 @@ class ClassicMetaController:
 
                 def do_nothing(rng):
                     return next_obs, env_state, next_done, rng
+
                 # All timesteps should be synchronized if fixed_timesteps
                 # therefore, they reset at the same time
                 next_obs, env_state, next_done, rng = jax.lax.cond(
@@ -336,7 +360,9 @@ class ClassicMetaController:
                 )
                 next_obs = jax.tree_util.tree_map(
                     lambda next_obs, reset_obs: jnp.where(
-                        next_done[0].reshape((1, next_done.shape[1]) + (1,) * (len(next_obs.shape) - 2)),
+                        next_done[0].reshape(
+                            (1, next_done.shape[1]) + (1,) * (len(next_obs.shape) - 2)
+                        ),
                         next_obs,
                         reset_obs,
                     ),
@@ -805,7 +831,7 @@ class ClassicMetaController:
             model_params = (agent_params, aux_params)
         else:
             rng = self.rng
-        
+
         if model_opt_params is None:
             opt_states = self.optimizer.init(model_params)
         else:
