@@ -345,7 +345,7 @@ class ClassicMetaController:
                 )
                 env_state = jax.tree_util.tree_map(
                     lambda env_state, reset_state: jnp.where(
-                        next_done[0],
+                        next_done[0].reshape((-1,) + (1,) * (len(env_state.shape) - 1)),
                         env_state,
                         reset_state,
                     ),
