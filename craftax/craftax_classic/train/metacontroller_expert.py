@@ -290,13 +290,13 @@ class ClassicMetaController:
                 next_lstm_states,
             )
             # set action of experts to noop if experts should drop out
-            action = action.at[1:].set(
-                jnp.where(
-                    jnp.expand_dims(env_state.timestep >= self.expert_drop_out, 0),
-                    jnp.zeros_like(action[1:]),
-                    action[1:],
-                )
-            )
+            # action = action.at[1:].set(
+            #     jnp.where(
+            #         jnp.expand_dims(env_state.timestep >= self.expert_drop_out, 0),
+            #         jnp.zeros_like(action[1:]),
+            #         action[1:],
+            #     )
+            # )
             rng, _rng = jax.random.split(rng)
             next_obs, env_state, reward, next_done, _info = self.step_fn(
                 jax.random.split(_rng, self.num_envs),
