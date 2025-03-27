@@ -823,7 +823,9 @@ def render_others_data(state, player=0):
     """
     Renders other players in the perspective of player.
     """
-
+    if state.player_position.shape[0] == 1:
+        # only one player
+        return jnp.zeros((0,))
     local_position = (
         state.player_position
         - state.player_position[player]

@@ -1,6 +1,5 @@
 from functools import partial
-from random import randrange
-from typing import Sequence, cast
+from typing import cast
 
 import flax.linen as nn
 import jax
@@ -14,7 +13,6 @@ from craftax.craftax_classic.envs.craftax_state import EnvParams, StaticEnvParam
 from craftax.craftax_classic.envs.craftax_symbolic_env import (
     CraftaxClassicSymbolicEnvShareStats,
     CraftaxClassicSymbolicEnvShareStatsNoAutoReset,
-    get_flat_map_obs_shape,
 )
 from craftax.craftax_classic.game_logic import are_players_alive
 from craftax.craftax_classic.train.logger import TrainLogger
@@ -96,6 +94,7 @@ class ClassicMetaController:
         num_envs: int = 8,
         num_steps: int = 300,
         fixed_timesteps: bool = False,
+        quick_reset: bool = False,
         num_iterations: int = 100,
         learning_rate: float = 2.5e-3,
         anneal_lr: bool = True,
@@ -111,9 +110,13 @@ class ClassicMetaController:
         proximity_bonus: float = 0.1,
         aux_coef: float = 0.3,
         max_grad_norm: float = 0.5,
+        expert_drop_out: float = 10000,
         # target_kl: float | None = None,
     ):
         """
+        Train a single agent, surrounded by experts.
+        Set static_params.num_players to number of experts + 1
+
         Params:
         - env_params: non-static parameters
         - static_parameters: static environment parameters
@@ -122,6 +125,7 @@ class ClassicMetaController:
         - num_steps: Number of steps to take for each batch. Note that this can be less than
             the actual number of steps used for training since the agent can be dead for some steps
         - fixed_timesteps: Fix the number of timesteps per episode
+        - quick_reset: Reset environment as soon as learner is dead
         - num_iterations: Number of rollout/training iterations
         - learning_rate: learning rate
         - anneal_lr: whether to anneal learning rate
@@ -137,13 +141,17 @@ class ClassicMetaController:
         - aux_coef: Auxillary loss coefficient
         - max_grad_norm: The maximum norm for gradient clipping
         - target_kl: target KL divergence threshold
+        - expert_drop_out: Threshold to remove experts halfway into the episode
         """
         self.static_params = static_parameters
         self.num_envs = num_envs
         self.fixed_timesteps = fixed_timesteps
+        self.quick_reset = quick_reset
         self.env_params = env_params
         self.timestep = self.env_params.max_timesteps
-        if fixed_timesteps:
+        if fixed_timesteps and quick_reset:
+            raise Exception("Cannot set both fixed_timesteps and quick_reset")
+        if fixed_timesteps or quick_reset:
             self.env = CraftaxClassicSymbolicEnvShareStatsNoAutoReset(
                 self.static_params
             )
@@ -155,6 +163,7 @@ class ClassicMetaController:
         self.reset_fn = jax.vmap(self.env.reset, in_axes=(0, None), out_axes=(1, 0))
         self.player_alive_check = jax.vmap(are_players_alive, out_axes=1)
         self.num_steps = num_steps
+        self.expert_drop_out = expert_drop_out
         # self.rng = jax.random.PRNGKey(randrange(2**31))
         self.rng = jax.random.PRNGKey(56)
         self.observation_space = self.env.observation_space(env_params)
@@ -209,10 +218,23 @@ class ClassicMetaController:
 
     @partial(jax.jit, static_argnums=(0,))
     def train_some_episodes(
-        self, rng, tick, model_params, opt_states, next_lstm_states, next_obs, env_state
+        self,
+        rng,
+        tick,
+        expert_params,
+        learner_params,
+        opt_states,
+        next_lstm_states,
+        next_obs,
+        env_state,
     ):
         rng, _rng = jax.random.split(rng)
-        agent_params, aux_params = model_params
+        agent_params, _aux_params = learner_params
+        concatenated_agent_params = jax.tree_util.tree_map(
+            lambda a, b: jnp.concatenate([jnp.expand_dims(a, 0), b], axis=0),
+            agent_params,
+            expert_params,
+        )
         next_done = jnp.zeros((self.static_params.num_players, self.num_envs))
         init_lstm_states = next_lstm_states
         if self.anneal_lr:
@@ -224,7 +246,7 @@ class ClassicMetaController:
         if self.fixed_timesteps:
             env_params = env_params.replace(max_timesteps=self.timestep_schedule(tick))  # pyright: ignore
 
-        def rollout_step(carry, step):
+        def rollout_step(carry, _step):
             (
                 next_obs,
                 next_done,
@@ -264,15 +286,34 @@ class ClassicMetaController:
             value, action, logprob, next_lstm_states = jax.vmap(eval_agent)(
                 jax.random.split(_rng, self.static_params.num_players),
                 jnp.arange(self.static_params.num_players),
-                agent_params,
+                concatenated_agent_params,
                 next_lstm_states,
             )
+            # set action of experts to noop if experts should drop out
+            # action = action.at[1:].set(
+            #     jnp.where(
+            #         jnp.expand_dims(env_state.timestep >= self.expert_drop_out, 0),
+            #         jnp.zeros_like(action[1:]),
+            #         action[1:],
+            #     )
+            # )
             rng, _rng = jax.random.split(rng)
             next_obs, env_state, reward, next_done, _info = self.step_fn(
                 jax.random.split(_rng, self.num_envs),
                 env_state,
                 action.astype(int),
                 env_params,
+            )
+            # zero out second part of observations if experts should be removed
+            next_obs = (
+                next_obs[0],
+                jnp.where(
+                    jnp.expand_dims(
+                        env_state.timestep >= self.expert_drop_out, (0, 2, 3)
+                    ),
+                    jnp.zeros_like(next_obs[1]),
+                    next_obs[1],
+                ),
             )
 
             # check if player is within view
@@ -287,22 +328,22 @@ class ClassicMetaController:
                 in_range = in_range.at[:, idx].set(False)
                 return jnp.any(in_range, axis=1)
 
-            can_see_others = jax.vmap(within_view)(
-                jnp.arange(self.static_params.num_players)
-            ).astype(float)
-
-            def reset_env(rng):
-                """Performs an environment reset"""
-                rng, _rng = jax.random.split(rng)
-                next_obs, env_state = self.reset_fn(
-                    jax.random.split(_rng, self.num_envs), self.env_params
-                )
-                return next_obs, env_state, jnp.ones_like(next_done), rng
-
-            def do_nothing(rng):
-                return next_obs, env_state, next_done, rng
+            # Only need to check non-expert
+            player_can_see_others = within_view(0)
 
             if self.fixed_timesteps:
+
+                def reset_env(rng):
+                    """Performs an environment reset"""
+                    rng, _rng = jax.random.split(rng)
+                    next_obs, env_state = self.reset_fn(
+                        jax.random.split(_rng, self.num_envs), self.env_params
+                    )
+                    return next_obs, env_state, jnp.ones_like(next_done), rng
+
+                def do_nothing(rng):
+                    return next_obs, env_state, next_done, rng
+
                 # All timesteps should be synchronized if fixed_timesteps
                 # therefore, they reset at the same time
                 next_obs, env_state, next_done, rng = jax.lax.cond(
@@ -312,7 +353,34 @@ class ClassicMetaController:
                     rng,
                 )
 
+            elif self.quick_reset:
+                rng, _rng = jax.random.split(rng)
+                reset_obs, reset_state = self.reset_fn(
+                    jax.random.split(_rng, self.num_envs), self.env_params
+                )
+                next_obs = jax.tree_util.tree_map(
+                    lambda next_obs, reset_obs: jnp.where(
+                        next_done[0].reshape(
+                            (1, next_done.shape[1]) + (1,) * (len(next_obs.shape) - 2)
+                        ),
+                        next_obs,
+                        reset_obs,
+                    ),
+                    next_obs,
+                    reset_obs,
+                )
+                env_state = jax.tree_util.tree_map(
+                    lambda env_state, reset_state: jnp.where(
+                        next_done[0].reshape((-1,) + (1,) * (len(env_state.shape) - 1)),
+                        env_state,
+                        reset_state,
+                    ),
+                    env_state,
+                    reset_state,
+                )
+
             next_done = next_done.astype(float)
+            # we only need to keep statistics for the one player that is training
             return (
                 next_obs,
                 next_done,
@@ -320,14 +388,16 @@ class ClassicMetaController:
                 next_lstm_states,
                 rng,
             ), (
-                init_obs,
-                next_obs,
-                init_done,
-                value,
-                action,
-                logprob,
-                reward,
-                can_see_others,
+                # Return only stuff of current player
+                self._idx(init_obs)[0],
+                self._idx(next_obs)[0],
+                init_done[0],
+                value[0],
+                action[0],
+                logprob[0],
+                reward[0],
+                player_can_see_others,
+                reward[1:],
             )
 
         # ugly code
@@ -348,6 +418,7 @@ class ClassicMetaController:
                 logprobs,
                 rewards,
                 can_see_others,
+                expert_rewards,
             ),
         ) = jax.lax.scan(
             rollout_step,
@@ -363,17 +434,23 @@ class ClassicMetaController:
 
         # bootstrap value if not done
         def produce_value(agent_param, next_obs, next_lstm_state, next_done):
-            return self.agent.apply(
-                agent_param,
-                next_obs,
-                next_lstm_state,
-                next_done,
-                method=CraftaxAgent.get_value,
-            ).flatten()  # pyright: ignore
+            return cast(
+                jax.Array,
+                self.agent.apply(
+                    agent_param,
+                    next_obs,
+                    next_lstm_state,
+                    next_done,
+                    method=CraftaxAgent.get_value,
+                ),
+            )
 
-        next_values = jax.vmap(produce_value)(
-            agent_params, next_obs, next_lstm_states, next_done
-        ).reshape(self.static_params.num_players, self.num_envs)
+        next_values = produce_value(
+            agent_params,
+            self._idx(next_obs)[0],
+            self._idx(next_lstm_states)[0],
+            next_done[0],
+        ).reshape(self.num_envs)
 
         def compute_advantages(carry, transition):
             lastgaelam, next_value, next_done = carry
@@ -386,7 +463,7 @@ class ClassicMetaController:
 
         _, advantages = jax.lax.scan(
             compute_advantages,
-            (jnp.zeros_like(next_done), next_values, next_done),
+            (jnp.zeros_like(next_done[0]), next_values, next_done[0]),
             (dones, values, rewards + self.proximity_bonus * can_see_others),
             reverse=True,
         )
@@ -555,16 +632,16 @@ class ClassicMetaController:
         # environment indices
         envinds = jnp.arange(self.num_envs)
 
-        def process_agent(agent_idx, model_param, opt_state, rng):
-            b_obs = self._idx(obs)[:, agent_idx]
-            b_future_obs = self._idx(future_obs)[:, agent_idx]
-            b_logprobs = logprobs[:, agent_idx]
-            b_actions = actions[:, agent_idx]
-            b_dones = dones[:, agent_idx]
-            b_advantages = advantages[:, agent_idx]
-            b_returns = returns[:, agent_idx]
-            b_values = values[:, agent_idx]
-            b_proximity = can_see_others[:, agent_idx]
+        def process_agent(model_param, opt_state, rng):
+            b_obs = obs
+            b_future_obs = future_obs
+            b_logprobs = logprobs
+            b_actions = actions
+            b_dones = dones
+            b_advantages = advantages
+            b_returns = returns
+            b_values = values
+            b_proximity = can_see_others
 
             def do_epoch(carry, epoch):
                 rng, model_param, optimizer_state = carry
@@ -588,7 +665,7 @@ class ClassicMetaController:
                     mb_values = b_values[:, mbenvinds]
                     mb_proximity = b_proximity[:, mbenvinds]
                     init_lstm_state = jax.tree.map(
-                        lambda state: state[agent_idx, mbenvinds], init_lstm_states
+                        lambda state: state[0, mbenvinds], init_lstm_states
                     )
 
                     (
@@ -684,7 +761,7 @@ class ClassicMetaController:
             )
 
         (
-            model_params,
+            learner_params,
             opt_states,
             agent_loss,
             agent_pg_loss,
@@ -692,15 +769,14 @@ class ClassicMetaController:
             agent_entropy_loss,
             agent_aux_loss,
             last_approx_kl,
-        ) = jax.vmap(process_agent)(
-            jnp.arange(self.static_params.num_players),
-            model_params,
+        ) = process_agent(
+            learner_params,
             opt_states,
-            jax.random.split(rng, self.static_params.num_players),
+            rng,
         )
 
         return (
-            model_params,
+            learner_params,
             opt_states,
             next_lstm_states,
             next_obs,
@@ -710,12 +786,13 @@ class ClassicMetaController:
             agent_v_loss,
             agent_entropy_loss,
             agent_aux_loss,
-            can_see_others.mean(axis=(0,2)),
-            rewards.mean(axis=(0, 2)),
+            can_see_others.mean(),
+            rewards.mean(),
             last_approx_kl,
+            expert_rewards.mean(axis=(0, 2)),
         )
 
-    def train(self, model_params=None):
+    def train(self, expert_params, model_params=None, model_opt_params=None):
         if model_params is None:
             dummy_obs = (
                 jnp.ones(
@@ -733,16 +810,16 @@ class ClassicMetaController:
             )
             dummy_done = jnp.ones((self.num_steps, self.num_envs))
             rng, _rng = jax.random.split(self.rng)
-            agent_params = jax.vmap(self.agent.init, in_axes=(0, None, None, None))(
-                jax.random.split(_rng, self.static_params.num_players),
+            agent_params = self.agent.init(
+                _rng,
                 dummy_obs,
                 dummy_lstm_state,
                 dummy_done,
             )
             rng, _rng = jax.random.split(rng)
             dummy_hidden = jnp.ones((self.num_steps, self.num_envs, 256))
-            aux_params = jax.vmap(self.aux.init, in_axes=(0, None))(
-                jax.random.split(_rng, self.static_params.num_players),
+            aux_params = self.aux.init(
+                _rng,
                 jnp.concatenate(
                     [
                         dummy_hidden,
@@ -754,7 +831,11 @@ class ClassicMetaController:
             model_params = (agent_params, aux_params)
         else:
             rng = self.rng
-        opt_states = jax.vmap(self.optimizer.init)(model_params)
+
+        if model_opt_params is None:
+            opt_states = self.optimizer.init(model_params)
+        else:
+            opt_states = model_opt_params
 
         # Logger
         log = TrainLogger(self.config, self.env_params, self.static_params)
@@ -785,34 +866,38 @@ class ClassicMetaController:
                 agent_proximity,
                 rewards,
                 last_approx_kl,
+                expert_rewards,
             ) = self.train_some_episodes(
                 _rng,
                 iteration,
+                expert_params,
                 model_params,
                 opt_states,
                 next_lstm_states,
                 next_obs,
                 env_state,
             )
-            log.insert_stat(iteration, "loss", agent_loss)
-            log.insert_stat(iteration, "reward", rewards)
-            log.insert_stat(iteration, "kl", last_approx_kl)
-            log.insert_stat(iteration, "pg_loss", agent_pg_loss)
-            log.insert_stat(iteration, "v_loss", agent_v_loss)
-            log.insert_stat(iteration, "entropy_loss", agent_entropy_loss)
-            log.insert_stat(iteration, "aux_loss", agent_aux_loss)
-            log.insert_stat(iteration, "proximity", agent_proximity)
+            log.insert_stat(iteration, "loss", [agent_loss])
+            log.insert_stat(iteration, "reward", [rewards])
+            log.insert_stat(iteration, "kl", [last_approx_kl])
+            log.insert_stat(iteration, "pg_loss", [agent_pg_loss])
+            log.insert_stat(iteration, "v_loss", [agent_v_loss])
+            log.insert_stat(iteration, "entropy_loss", [agent_entropy_loss])
+            log.insert_stat(iteration, "aux_loss", [agent_aux_loss])
+            log.insert_stat(iteration, "proximity", [agent_proximity])
+            log.insert_stat(iteration, "expert_rewards", expert_rewards)
             if iteration % 20 == 0:
                 log.insert_model_snapshot(iteration, model_params)
-            for agent in range(self.static_params.num_players):
-                print("Agent", agent, "loss:", agent_loss[agent])
-                print("Agent", agent, "PG loss:", agent_pg_loss[agent])
-                print("Agent", agent, "value loss:", agent_v_loss[agent])
-                print("Agent", agent, "entropy:", agent_entropy_loss[agent])
-                print("Agent", agent, "auxillary loss:", agent_aux_loss[agent])
-                print("Agent", agent, "mean proximity:", agent_proximity[agent])
-                print("Agent", agent, "reward:", rewards[agent])
-                print("Agent", agent, "approx KL:", last_approx_kl[agent], flush=True)
+            print("Agent loss:", agent_loss)
+            print("Agent PG loss:", agent_pg_loss)
+            print("Agent value loss:", agent_v_loss)
+            print("Agent entropy:", agent_entropy_loss)
+            print("Agent auxillary loss:", agent_aux_loss)
+            print("Agent mean proximity:", agent_proximity)
+            print("Agent reward:", rewards)
+            print("Agent approx KL:", last_approx_kl, flush=True)
+            for i, expert_reward in enumerate(expert_rewards):
+                print("Expert", i, "reward:", expert_reward)
         return model_params, opt_states, log
 
     def run_one_episode(self, model_params):
@@ -870,6 +955,12 @@ class ClassicMetaController:
 
 
 if __name__ == "__main__":
+    import pickle
+
+    with open("/Users/ericye/code/craftax_tests/params-ippo-v4.p", "rb") as f:
+        expert_params = pickle.load(f)
+    # keep first 3 agents
+    expert_params = jax.tree_util.tree_map(lambda x: x[1:], expert_params)
     metacontroller = ClassicMetaController(
         static_parameters=StaticEnvParams(num_players=4),
         num_envs=10,
@@ -880,10 +971,11 @@ if __name__ == "__main__":
         anneal_lr=False,
         learning_rate=2.5e-4,
         max_grad_norm=1.0,
-        fixed_timesteps=True,
+        fixed_timesteps=False,
+        quick_reset=True,
         proximity_bonus=0.0,
     )
-    params, opt_states, log = metacontroller.train()
+    params, opt_states, log = metacontroller.train(expert_params)
     # states, actions, logits, rewards = metacontroller.run_one_episode(params)
     # replay_episode(states, actions, 4, 0)
     # n_steps = 10
