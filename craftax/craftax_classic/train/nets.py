@@ -3,11 +3,18 @@ import jax
 import jax.numpy as jnp
 from flax.linen import initializers
 
+try:
+    from jax.tree_util import tree_map
+except Exception:
+    # Very old JAX fallback
+    from jax import tree_map  # type: ignore
+
 
 class ZNet(nn.Module):
     @nn.compact
     def __call__(self, x):
         return nn.Dense(128)(x)
+
 
 class LSTM(nn.Module):
     features: int
@@ -25,7 +32,7 @@ class LSTM(nn.Module):
             def __call__(self, carry, inputs):
                 inputs, terminate = inputs
                 # Reset the hidden state on termination
-                carry = jax.tree.map(
+                carry = jax.tree_util.tree_map(
                     lambda carry_component: jax.lax.select(
                         jnp.repeat(
                             jnp.reshape(terminate != 0.0, (-1, 1)),

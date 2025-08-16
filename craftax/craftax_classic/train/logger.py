@@ -15,6 +15,7 @@ class TrainLogger:
     model_snapshots: list[tuple[int, Any]]
     stats: dict[str, list[tuple[int, Any]]]
     wandb_project: str
+    run_name: str
 
     def __init__(
         self,
@@ -22,6 +23,7 @@ class TrainLogger:
         env_params: EnvParams,
         static_env_params: StaticEnvParams,
         wandb_project: str = "",
+        run_name: str = "",
     ) -> None:
         self.train_params = train_params
         self.env_params = env_params
@@ -29,12 +31,18 @@ class TrainLogger:
         self.model_snapshots = []
         self.stats = {}
         self.wandb_project = wandb_project
+        self.run_name = run_name
         if wandb_project:
             os.environ["WANDB_MODE"] = "online"
             os.environ["WANDB_PROJECT"] = wandb_project
 
             config = {**train_params, **asdict(env_params), **asdict(static_env_params)}
-            wandb.init(project=wandb_project, config=config)
+            wandb.init(
+                project=self.wandb_project,
+                entity="maytusp",
+                config=config,
+                name=self.run_name,
+            )
 
             print("CONFIG")
             print(wandb.config)
@@ -44,8 +52,8 @@ class TrainLogger:
 
     def insert_model_snapshot(self, iteration: int, model: Any) -> None:
         if self.wandb_project:
-            file_name = f'model_iter_{iteration}.pickle'
-            with open(os.path.join(wandb.run.dir, file_name), 'wb') as f:
+            file_name = f"{self.run_name}_model_iter_{iteration}.pickle"
+            with open(os.path.join(wandb.run.dir, file_name), "wb") as f:
                 pickle.dump(model, f)
         else:
             self.model_snapshots.append((iteration, model))

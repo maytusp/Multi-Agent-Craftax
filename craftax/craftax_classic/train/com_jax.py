@@ -1,6 +1,4 @@
-import sys
-
-sys.path.insert(0, "/home/maytus/emergent_language/ma_craftax")
+# Add communication between agents
 import craftax
 from functools import partial
 from random import randrange
@@ -34,6 +32,8 @@ from nets import LSTM, ZNet
 class CraftaxAgent(nn.Module):
     action_space: int
     observe_others: bool
+    msg_vocab_size: int = 16  # NEW: size of the discrete token space
+    msg_embed_dim: int = 32  # NEW: size of the message embedding
 
     def setup(self):
         self.network = nn.Sequential(
@@ -48,12 +48,62 @@ class CraftaxAgent(nn.Module):
         self.actor_out = nn.Dense(
             self.action_space, kernel_init=initializers.orthogonal(0.01)
         )
+
+        # NEW: message “actor” head (categorical over msg_vocab_size)
+        self.msg_1 = nn.Dense(128, kernel_init=initializers.orthogonal(2))
+        self.msg_out = nn.Dense(
+            self.msg_vocab_size, kernel_init=initializers.orthogonal(0.01)
+        )
+
         self.critic_1 = nn.Dense(128, kernel_init=initializers.orthogonal(2))
         self.critic_out = nn.Dense(1, kernel_init=initializers.orthogonal(1.0))
+
         self.lstm = LSTM(256)
         self.znet = ZNet()
 
-    def get_states(self, x, lstm_state, done):
+        # NEW: learnable lookup table for received tokens
+        self.msg_embed = nn.Embed(
+            num_embeddings=self.msg_vocab_size, features=self.msg_embed_dim
+        )
+
+    def _embed_received_messages(self, recv_tokens, agent_idx, reduce: str = "sum"):
+        """
+        recv_tokens: (..., num_envs, num_players) or (num_envs, num_players)
+                    We treat the LAST axis as players.
+        agent_idx:   scalar index of the current agent (0..P-1)
+        Returns:     (..., num_envs, D) or (num_envs, D) — same leading dims as recv_tokens, with players aggregated.
+        """
+        # Ensure integer indices for the embedding
+        tokens = recv_tokens.astype(jnp.int32)  # (..., P)
+
+        # Embed every player's token
+        emb_all = self.msg_embed(tokens)  # (..., P, D)
+
+        P = tokens.shape[-1]
+        # One-hot for "self", then mask them out without dynamic boolean indexing
+        self_hot = jax.nn.one_hot(agent_idx, P, dtype=emb_all.dtype)  # (P,)
+        # reshape to broadcast across leading dims and feature dim
+        expand = (1,) * (emb_all.ndim - 2) + (P, 1)
+        self_hot = self_hot.reshape(expand)  # (..., P, 1)
+        mask = 1.0 - self_hot  # (..., P, 1)
+        # TODO Change this message aggregation function when number of agents > 2
+        emb = (emb_all * mask).sum(axis=-2)  # (..., D)
+
+        if reduce == "mean":
+            emb = emb / jnp.maximum(1.0, jnp.array(P - 1, dtype=emb.dtype))
+
+        return emb
+
+    def get_states(self, x, lstm_state, done, recv_tokens=None, agent_idx=None):
+        """
+        If observe_others: x is (agent_data, inventories)
+        Else: x is agent_data
+        If recv_tokens is provided, we append aggregated message embedding.
+        """
+        # jax.debug.print("done shape: {s}", s=done.shape)
+        # if recv_tokens is not None:
+        #     jax.debug.print("recv_tokens shape: {s}", s=recv_tokens.shape)
+
         if self.observe_others:
             agent_data, inventories = x
             inventories = self.znet(inventories)
@@ -61,6 +111,15 @@ class CraftaxAgent(nn.Module):
             x = jnp.concatenate(
                 [agent_data, inventories.reshape(new_inventory_shape)], axis=-1
             )
+        # Append message embedding if provided
+        if recv_tokens is not None and agent_idx is not None:
+            msg_emb = self._embed_received_messages(
+                recv_tokens, agent_idx
+            )  # (num_envs, D)
+            # jax.debug.print("msg_emb shape: {s}", s=msg_emb.shape)
+            # jax.debug.print("x shape: {s}", s=x.shape)
+            x = jnp.concatenate([x, msg_emb], axis=-1)
+
         x = self.network(x)
         return self.lstm(x, done, lstm_state)
 
@@ -70,21 +129,36 @@ class CraftaxAgent(nn.Module):
         x = self.actor_out(x)
         return x
 
+    def message_actor(self, x):
+        x = self.msg_1(x)
+        x = nn.relu(x)
+        return self.msg_out(x)
+
     def critic(self, x):
         x = self.critic_1(x)
         x = nn.relu(x)
         x = self.critic_out(x)
         return x
 
-    def get_value(self, x, lstm_state, done):
-        hidden, _ = self.get_states(x, lstm_state, done)
+    def get_value(self, x, lstm_state, done, recv_tokens=None, agent_idx=None):
+        hidden, _ = self.get_states(x, lstm_state, done, recv_tokens, agent_idx)
         return self.critic(hidden)
 
-    def __call__(self, x, lstm_state, done):
-        hidden, lstm_state = self.get_states(x, lstm_state, done)
-        logits = self.actor(hidden)
+    def __call__(self, x, lstm_state, done, recv_tokens=None, agent_idx=None):
+        """
+        Returns:
+          action_logits: (num_envs, action_space)
+          message_logits: (num_envs, msg_vocab_size)
+          value: (num_envs, 1)
+          lstm_state: ...
+        """
+        hidden, lstm_state = self.get_states(
+            x, lstm_state, done, recv_tokens, agent_idx
+        )
+        action_logits = self.actor(hidden)
+        msg_logits = self.message_actor(hidden)
         value = self.critic(hidden)
-        return logits, value, lstm_state
+        return action_logits, msg_logits, value, lstm_state
 
 
 class ClassicMetaController:
@@ -106,10 +180,14 @@ class ClassicMetaController:
         clip_coef: float = 0.2,
         norm_adv: bool = True,
         clip_vloss: bool = True,
-        ent_coef: float = 0.01,
+        act_ent_coef: float = 0.01,
+        msg_ent_coef: float = 0.002,
         vf_coef: float = 0.5,
         max_grad_norm: float = 0.5,
         wandb_project=None,
+        run_name=None,
+        msg_vocab_size: int = 16,
+        msg_embed_dim: int = 32,
         # target_kl: float | None = None,
     ):
         """
@@ -176,7 +254,8 @@ class ClassicMetaController:
         self.clip_coef = clip_coef
         self.norm_adv = norm_adv
         self.clip_vloss = clip_vloss
-        self.ent_coef = ent_coef
+        self.act_ent_coef = act_ent_coef
+        self.msg_ent_coef = msg_ent_coef
         self.vf_coef = vf_coef
         self.max_grad_norm = max_grad_norm
         # self.target_kl = target_kl
@@ -193,7 +272,16 @@ class ClassicMetaController:
         ):
             del self.config[unwanted]
 
-        self.agent = CraftaxAgent(self.action_space.n, observe_others)
+        self.msg_vocab_size = msg_vocab_size
+        self.msg_embed_dim = msg_embed_dim
+
+        self.agent = CraftaxAgent(
+            self.action_space.n,
+            self.observe_others,
+            msg_vocab_size=self.msg_vocab_size,
+            msg_embed_dim=self.msg_embed_dim,
+        )
+
         self.optimizer = optax.chain(
             optax.clip_by_global_norm(self.max_grad_norm),
             optax.inject_hyperparams(optax.adam)(learning_rate=self.learning_rate),
@@ -207,6 +295,7 @@ class ClassicMetaController:
             round(self.num_iterations * 0.8),
         )
         self.wandb_project = wandb_project
+        self.run_name = run_name
 
     @partial(jax.jit, static_argnums=(0,))
     def train_some_episodes(
@@ -226,48 +315,82 @@ class ClassicMetaController:
                 max_timesteps=self.timestep_schedule(tick)
             )  # pyright: ignore
 
+        recv_tokens = jnp.zeros(
+            (self.num_envs, self.static_params.num_players), dtype=jnp.int32
+        )
+
         def rollout_step(carry, step):
-            (
-                next_obs,
-                next_done,
-                env_state,
-                next_lstm_states,
-                rng,
-            ) = carry
+            (next_obs, next_done, env_state, next_lstm_states, rng, recv_tokens) = carry
             init_obs = next_obs
             init_done = next_done
             # agents_alive = self.player_alive_check(env_state)
 
             def eval_agent(rng, agent_idx, model_param, next_lstm_state):
                 rng, _rng = jax.random.split(rng)
-                logits, value, next_lstm_state = self.agent.apply(  # pyright: ignore
+
+                (
+                    action_logits,
+                    msg_logits,
+                    value,
+                    next_lstm_state,
+                ) = self.agent.apply(  # pyright: ignore
                     model_param,
                     self._idx(next_obs)[agent_idx],
                     next_lstm_state,
                     next_done[agent_idx],
+                    recv_tokens=recv_tokens,
+                    agent_idx=agent_idx,
                 )
-                # sets the action to NOOP if player is dead or sleeping
-                # I think this does more harm than good
-                # action = jax.lax.select(
-                #     ~agents_alive[agent_idx] | env_state.is_sleeping[:, agent_idx],
-                #     jnp.full(self.num_envs, Action.NOOP.value),
-                #     jax.random.categorical(_rng, logits),
-                # )
-                action = jax.random.categorical(_rng, logits)
+
+                # sample action + message token
+                action = jax.random.categorical(_rng, action_logits)
+                rng2, _rng2 = jax.random.split(rng)
+                message = jax.random.categorical(_rng2, msg_logits)
+
+                # logprobs
+                act_logprob = jax.nn.log_softmax(action_logits)[
+                    jnp.arange(self.num_envs), action
+                ]
+                msg_logprob = jax.nn.log_softmax(msg_logits)[
+                    jnp.arange(self.num_envs), message
+                ]
+                joint_logprob = act_logprob + msg_logprob
+
+                # entropies
+                act_probs = jax.nn.softmax(action_logits)
+                msg_probs = jax.nn.softmax(msg_logits)
+                act_entropy = -jnp.sum(
+                    act_probs * jax.nn.log_softmax(action_logits), axis=-1
+                )
+                msg_entropy = -jnp.sum(
+                    msg_probs * jax.nn.log_softmax(msg_logits), axis=-1
+                )
+                joint_entropy = act_entropy + msg_entropy
+
                 return (
-                    value.flatten(),  # pyright: ignore
+                    value.flatten(),
                     action,
-                    jax.nn.log_softmax(logits)[jnp.arange(self.num_envs), action],
+                    message,
+                    joint_logprob,
+                    joint_entropy,
                     next_lstm_state,
                 )
 
             rng, _rng = jax.random.split(rng)
-            value, action, logprob, next_lstm_states = jax.vmap(eval_agent)(
+            (
+                value,
+                action,
+                message,
+                joint_logprob,
+                joint_entropy,
+                next_lstm_states,
+            ) = jax.vmap(eval_agent)(
                 jax.random.split(_rng, self.static_params.num_players),
                 jnp.arange(self.static_params.num_players),
                 model_params,
                 next_lstm_states,
             )
+
             rng, _rng = jax.random.split(rng)
             next_obs, env_state, reward, next_done, _info = self.step_fn(
                 jax.random.split(_rng, self.num_envs),
@@ -275,6 +398,8 @@ class ClassicMetaController:
                 action.astype(int),
                 env_params,
             )
+
+            recv_tokens_next = message.T.astype(jnp.int32)
 
             def reset_env(rng):
                 """Performs an environment reset"""
@@ -304,42 +429,51 @@ class ClassicMetaController:
                 env_state,
                 next_lstm_states,
                 rng,
-            ), (init_obs, init_done, value, action, logprob, reward)
+                recv_tokens_next,
+            ), (
+                init_obs,
+                init_done,
+                value,
+                action,
+                message,
+                joint_logprob,
+                reward,
+                joint_entropy,
+            )
 
-        # ugly code
+        # Rollout loop (use scan instead of for)
         (
-            (
-                next_obs,
-                next_done,
-                env_state,
-                next_lstm_states,
-                rng,
-            ),
-            (obs, dones, values, actions, logprobs, rewards),
+            (next_obs, next_done, env_state, next_lstm_states, rng, recv_tokens),
+            (obs, dones, values, actions, messages, logprobs, rewards, entropies),
         ) = jax.lax.scan(
             rollout_step,
-            (
-                next_obs,
-                next_done,
-                env_state,
-                next_lstm_states,
-                rng,
-            ),
+            (next_obs, next_done, env_state, next_lstm_states, rng, recv_tokens),
             jnp.arange(self.num_steps),
         )
 
         # bootstrap value if not done
-        def produce_value(model_param, next_obs, next_lstm_state, next_done):
+        def produce_value(
+            model_param, next_obs, next_lstm_state, next_done, recv_tokens, agent_idx
+        ):
             return self.agent.apply(
                 model_param,
                 next_obs,
                 next_lstm_state,
                 next_done,
+                recv_tokens,
+                agent_idx,
                 method=CraftaxAgent.get_value,
             ).flatten()  # pyright: ignore
 
-        next_values = jax.vmap(produce_value)(
-            model_params, next_obs, next_lstm_states, next_done
+        player_idx = jnp.arange(self.static_params.num_players)
+
+        next_values = jax.vmap(produce_value, in_axes=(0, 0, 0, 0, None, 0))(
+            model_params,
+            next_obs,
+            next_lstm_states,
+            next_done,
+            recv_tokens,  # shared for all agents
+            player_idx,
         ).reshape(self.static_params.num_players, self.num_envs)
 
         def compute_advantages(carry, transition):
@@ -365,22 +499,41 @@ class ClassicMetaController:
             mb_obs,
             mb_logprobs,
             mb_actions,
+            mb_messages,
             mb_dones,
             mb_advantages,
             mb_returns,
             mb_values,
             init_lstm_state,
+            mb_recv_tokens,
+            agent_idx,
         ):
-            logits, newvalue, _ = self.agent.apply(  # pyright: ignore
-                model_params, mb_obs, init_lstm_state, mb_dones
+            (
+                action_logits,
+                msg_logits,
+                newvalue,
+                _,
+            ) = self.agent.apply(  # pyright: ignore
+                model_params,
+                mb_obs,
+                init_lstm_state,
+                mb_dones,
+                recv_tokens=mb_recv_tokens,
+                agent_idx=agent_idx,
             )
-            probs = jax.nn.softmax(logits)
-            newlogprobs = jnp.log(probs)
-            entropy = -jnp.sum(probs * newlogprobs, axis=-1)
-            # basically newlogprobs[action], where action tells us what to take in the last dimension
-            newlogprob = jnp.take_along_axis(
-                newlogprobs, jnp.expand_dims(mb_actions.astype(int), axis=-1), axis=-1
+
+            # probs/logprobs
+            act_logprobs = jax.nn.log_softmax(action_logits)
+            msg_logprobs = jax.nn.log_softmax(msg_logits)
+            new_act_lp = jnp.take_along_axis(
+                act_logprobs, mb_actions[..., None].astype(int), axis=-1
             ).squeeze(-1)
+            new_msg_lp = jnp.take_along_axis(
+                msg_logprobs, mb_messages[..., None].astype(int), axis=-1
+            ).squeeze(-1)
+            newlogprob = new_act_lp + new_msg_lp
+
+            # ratio
             logratio = newlogprob - mb_logprobs
             ratio = jnp.exp(logratio)
 
@@ -417,8 +570,16 @@ class ClassicMetaController:
             else:
                 v_loss = 0.5 * ((newvalue - mb_returns) ** 2).mean()
 
-            entropy_loss = entropy.mean()
-            loss = pg_loss - self.ent_coef * entropy_loss + v_loss * self.vf_coef
+            # total entropy = action entropy + message entropy
+            act_probs = jax.nn.softmax(action_logits)
+            msg_probs = jax.nn.softmax(msg_logits)
+            act_entropy = -jnp.sum(act_probs * act_logprobs, axis=-1)
+            msg_entropy = -jnp.sum(msg_probs * msg_logprobs, axis=-1)
+            entropy_loss = (
+                self.act_ent_coef * act_entropy + self.msg_ent_coef * msg_entropy
+            ).mean()
+
+            loss = pg_loss - entropy_loss + v_loss * self.vf_coef
             return loss, (
                 pg_loss,
                 v_loss,
@@ -438,6 +599,7 @@ class ClassicMetaController:
             b_obs = self._idx(obs)[:, agent_idx]
             b_logprobs = logprobs[:, agent_idx]
             b_actions = actions[:, agent_idx]
+            b_messages = messages[:, agent_idx]
             b_dones = dones[:, agent_idx]
             b_advantages = advantages[:, agent_idx]
             b_returns = returns[:, agent_idx]
@@ -458,6 +620,7 @@ class ClassicMetaController:
                     mb_obs = self._idx(b_obs)[:, mbenvinds]
                     mb_logprobs = b_logprobs[:, mbenvinds]
                     mb_actions = b_actions[:, mbenvinds]
+                    mb_messages = b_messages[:, mbenvinds]
                     mb_dones = b_dones[:, mbenvinds]
                     mb_advantages = b_advantages[:, mbenvinds]
                     mb_returns = b_returns[:, mbenvinds]
@@ -465,17 +628,28 @@ class ClassicMetaController:
                     init_lstm_state = tree_map(
                         lambda state: state[agent_idx, mbenvinds], init_lstm_states
                     )
-
+                    # Messages visible in this minibatch: take the *corresponding* received tokens
+                    # We saved only the sent tokens in `messages` above; the received tokens for this step
+                    # are simply those sent tokens transposed (per step). For simplicity, reuse `messages`
+                    # as "what will be seen next step". Here we align by environment indices.
+                    mb_recv_tokens = messages[:, :, mbenvinds]  # (T, P, E_mb)
+                    # For PPO, we need one-per-time slice, so align shapes to (T*E_mb, P) by merging dims,
+                    # or keep (T, E_mb, P) and rely on broadcasting inside the forward (already works
+                    # since we pass the right env slice for each time step). Easiest: roll with the
+                    # same time/env slicing we use for mb_obs.
                     (loss, (pg_loss, v_loss, entropy_loss, approx_kl)), grads = grad_fn(
                         model_param,
                         mb_obs,
                         mb_logprobs,
                         mb_actions,
+                        mb_messages,
                         mb_dones,
                         mb_advantages,
                         mb_returns,
                         mb_values,
                         init_lstm_state,
+                        mb_recv_tokens.transpose(0, 2, 1),  # reshape to (T, E_mb, P)
+                        agent_idx,
                     )
                     updates, optimizer_state = self.optimizer.update(
                         grads, optimizer_state, model_param
@@ -580,11 +754,19 @@ class ClassicMetaController:
             )
             dummy_done = jnp.ones((self.num_steps, self.num_envs))
             rng, _rng = jax.random.split(self.rng)
-            model_params = jax.vmap(self.agent.init, in_axes=(0, None, None, None))(
+            dummy_recv = jnp.zeros(
+                (self.num_steps, self.num_envs, self.static_params.num_players),
+                dtype=jnp.int32,
+            )
+            model_params = jax.vmap(
+                self.agent.init, in_axes=(0, None, None, None, None, None)
+            )(
                 jax.random.split(_rng, self.static_params.num_players),
                 dummy_obs,
                 dummy_lstm_state,
                 dummy_done,
+                dummy_recv,  # recv_tokens
+                jnp.int32(0),  # agent_idx (any valid index for tracing)
             )
         else:
             rng = self.rng
@@ -592,7 +774,11 @@ class ClassicMetaController:
 
         # Logger
         log = TrainLogger(
-            self.config, self.env_params, self.static_params, self.wandb_project
+            self.config,
+            self.env_params,
+            self.static_params,
+            self.wandb_project,
+            self.run_name,
         )
 
         # initialize environment
@@ -716,6 +902,7 @@ if __name__ == "__main__":
         fixed_timesteps=False,
         observe_others=True,
         wandb_project="ma_craftax",
+        run_name="comm_ppo",
     )
     params, opt_states, log = metacontroller.train()
     # states, actions, logits, rewards = metacontroller.run_one_episode(params)
